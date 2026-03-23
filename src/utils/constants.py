@@ -1,0 +1,45 @@
+INCOTERM_OPTIONS = [
+    "",
+    "EXW — Ex Works",
+    "FCA — Free Carrier",
+    "CPT — Carriage Paid To",
+    "CIP — Carriage and Insurance Paid To",
+    "DAP — Delivered at Place",
+    "DPU — Delivered at Place Unloaded",
+    "DDP — Delivered Duty Paid",
+    "FAS — Free Alongside Ship",
+    "FOB — Free on Board",
+    "CFR — Cost and Freight",
+    "CIF — Cost Insurance and Freight",
+]
+
+EMBALAJE_TYPES = [
+    "",
+    "Caja de cartón",
+    "Pallet",
+    "Cajón de madera",
+    "Tambor / Barril",
+    "Bolsa",
+    "Contenedor",
+    "Granel",
+    "Otro",
+]
+
+COUNTRIES = [
+    "",
+    "Chile",
+    "Argentina",
+    "Bolivia",
+    "Brasil",
+    "Colombia",
+    "Ecuador",
+    "Paraguay",
+    "Perú",
+    "Uruguay",
+    "Venezuela",
+    "México",
+    "Estados Unidos",
+    "España",
+    "China",
+    "Otro",
+]

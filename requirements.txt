@@ -12,6 +12,7 @@ pydantic>=2.7.0
 # --- PDF manipulation (Fase 1: leer; Fase 2: rellenar/extraer) ---
 pypdf>=4.2.0
 pdfplumber>=0.11.0
+reportlab>=4.0.0
 
 # --- Database ORM (Fase 2 stub) ---
 SQLAlchemy>=2.0.0

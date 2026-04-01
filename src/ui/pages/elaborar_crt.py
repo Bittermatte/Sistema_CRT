@@ -1,6 +1,6 @@
 import streamlit as st
 
-from src.services.pdf_service import render_pdf_with_overlay
+from src.services.pdf_service import generate_crt_pdf, render_pdf_preview
 from src.utils.constants import INCOTERM_OPTIONS, EMBALAJE_TYPES, COUNTRIES
 
 
@@ -31,7 +31,17 @@ def render_elaborar_crt():
         if st.button("Limpiar formulario", use_container_width=True):
             _limpiar_formulario()
     with col_guardar:
-        st.button("Guardar CRT", use_container_width=True, type="primary")
+        pdf_bytes = generate_crt_pdf(dict(st.session_state))
+        numero = st.session_state.get("f_numero_crt", "borrador").replace("/", "-")
+        st.download_button(
+            label="⬇ Descargar PDF",
+            data=pdf_bytes or b"",
+            file_name=f"CRT_{numero}.pdf",
+            mime="application/pdf",
+            disabled=pdf_bytes is None,
+            type="primary",
+            use_container_width=True,
+        )
 
     st.divider()
 
@@ -85,7 +95,7 @@ def _render_crt_form():
         st.text_area(
             "6. Dirección del Remitente",
             key="f_dir_remitente",
-            placeholder="Calle, número, ciudad, país",
+            placeholder="Calle y número\nCiudad, País",
             height=80,
         )
 
@@ -102,6 +112,11 @@ def _render_crt_form():
             placeholder="Calle, número, ciudad, país",
             height=80,
         )
+        st.text_input("6. Consignatario (Nombre / Razón Social)", key="f_consignatario", placeholder="Ej: AQUACHILE INC.")
+        st.text_area("Dirección del Consignatario", key="f_dir_consignatario", placeholder="Calle, número, ciudad, país", height=60)
+        st.text_input("9. Notificar a", key="f_notificar", placeholder="Ej: AQUACHILE INC.")
+        st.text_area("Dirección Notificar a", key="f_dir_notificar", placeholder="Calle, número, ciudad, país", height=60)
+        st.text_input("Destino Final", key="f_destino_final", placeholder="Ej: ARGENTINA - DESTINO FINAL USA")
 
     # ── 4. Transporte y Ruta ──────────────────────────────────────────────────
     with st.expander("Transporte y Ruta", expanded=True):
@@ -170,6 +185,14 @@ def _render_crt_form():
                 key="f_num_factura",
                 placeholder="Ej: FAC-2026-00123",
             )
+        st.text_input("Valor Mercadería (USD)", key="f_valor_mercaderia", placeholder="Ej: 63.746,90")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.text_input("Flete ORIGEN/FRONTERA (USD)", key="f_flete_origen", placeholder="Ej: 148.32")
+        with c2:
+            st.text_input("Flete FRONTERA/DESTINO (USD)", key="f_flete_frontera", placeholder="Ej: 1705.68")
+        st.text_input("Guías de Despacho Nros", key="f_guias_despacho", placeholder="Ej: 497446, 497447")
+        st.text_input("Certificado Sanitario Nro", key="f_cert_sanitario", placeholder="Ej: 1813578")
         st.text_area(
             "18. Instrucciones de Aduana",
             key="f_instrucciones_aduana",
@@ -180,12 +203,19 @@ def _render_crt_form():
 
     # ── 6. Descripción de la Carga ────────────────────────────────────────────
     with st.expander("Descripción de la Carga", expanded=True):
-        st.text_area(
-            "20. Descripción de la Mercadería",
-            key="f_descripcion",
-            placeholder="Descripción detallada de los bienes transportados",
-            height=100,
-        )
+        st.text_area("Descripción Lote 1", key="f_descripcion_1", placeholder="Ej: 175 CAJAS CON SALMON DEL ATLANTICO...", height=60)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.text_input("Kilos Netos Lote 1", key="f_kilos_netos_1", placeholder="Ej: 3.541,69")
+        with c2:
+            st.text_input("Total Cajas Lote 1", key="f_total_cajas_1", placeholder="Ej: 175")
+        st.text_area("Descripción Lote 2", key="f_descripcion_2", placeholder="Ej: 175 CAJAS CON SALMON DEL ATLANTICO...", height=60)
+        c3, c4 = st.columns(2)
+        with c3:
+            st.text_input("Kilos Netos Lote 2", key="f_kilos_netos_2", placeholder="Ej: 2.828,29")
+        with c4:
+            st.text_input("Total Cajas Lote 2", key="f_total_cajas_2", placeholder="Ej: 175")
+        st.number_input("Total Cajas (suma)", key="f_total_cajas", min_value=0, step=1)
         c1, c2 = st.columns(2)
         with c1:
             st.number_input(
@@ -218,21 +248,24 @@ def _render_crt_form():
             )
 
 
+    # ── 7. Transporte — Conductor y Vehículo ─────────────────────────────────
+    with st.expander("Transporte — Conductor y Vehículo", expanded=False):
+        st.text_input("Conductor (nombre completo)", key="f_conductor", placeholder="Ej: DIEGO TALAVERA")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.text_input("Patente Camión", key="f_patente_camion", placeholder="Ej: AD945RW")
+        with c2:
+            st.text_input("Patente Rampla", key="f_patente_rampla", placeholder="Ej: GZW912")
+
+
 # ── Live Preview PDF ─────────────────────────────────────────────────────────
 
 def _render_pdf_preview():
     st.subheader("Vista Previa — Plantilla CRT")
-
-    img_bytes = render_pdf_with_overlay(dict(st.session_state))
-
+    img_bytes = render_pdf_preview(dict(st.session_state))
     if img_bytes is None:
-        st.warning(
-            "No se encontró `plantillas/crt_blanco.pdf`. "
-            "Verifique que el archivo existe en el directorio del proyecto.",
-            icon="⚠️",
-        )
+        st.warning("No se encontró `plantillas/crt_blanco.pdf`.", icon="⚠️")
         return
-
     st.image(img_bytes, use_container_width=True)
 
 

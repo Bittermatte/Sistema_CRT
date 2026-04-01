@@ -1,54 +1,58 @@
 """
-Servicio PDF — Fase 1: renderizado del template con overlay de datos del formulario.
-Fase 2 añadirá: fill_pdf_fields() y extract_fields_from_pdf().
+Servicio PDF — Fase 1: overlay de datos sobre plantilla CRT vacía.
 
-Coordenadas calibradas con cuadrícula sobre pdfplumber (página 612×1008 pts).
+Estrategia: se usa pypdf para leer la plantilla base (crt_blanco.pdf) y
+ReportLab para generar una capa transparente con los datos del formulario,
+luego se fusionan ambas páginas. Las coordenadas, fuentes y tamaños son
+exactamente los del documento original generado en Google Sheets.
+
+Sistema de coordenadas ReportLab: origen en la esquina INFERIOR IZQUIERDA.
+Para convertir desde pdfplumber (origen superior izq): y_rl = page_h - y_pl
+
+Página: 612 × 1008 pts
 """
 
 import io
 from pathlib import Path
 from typing import Optional
 
-import pypdfium2 as pdfium
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+from pypdf import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 PDF_TEMPLATE_PATH = Path("plantillas/crt_blanco.pdf")
-RENDER_SCALE = 2.0  # 612×2=1224 px  |  1008×2=2016 px
+PAGE_W = 612.0
+PAGE_H = 1008.0
 
+_FONT_PATHS = {
+    "Carlito":             "/usr/share/fonts/truetype/crosextra/Carlito-Regular.ttf",
+    "Carlito-Bold":        "/usr/share/fonts/truetype/crosextra/Carlito-Bold.ttf",
+    "LiberationSans":      "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "LiberationSans-Bold": "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+}
 
-# ---------------------------------------------------------------------------
-# Fuentes
-# ---------------------------------------------------------------------------
-
-def _load_font(size_pts: float) -> ImageFont.ImageFont:
-    size_px = max(10, int(size_pts * RENDER_SCALE))
-    for path in [
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/System/Library/Fonts/Arial.ttf",
-        "/Library/Fonts/Arial.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]:
+def _register_fonts():
+    for name, path in _FONT_PATHS.items():
         try:
-            return ImageFont.truetype(path, size=size_px)
-        except (IOError, OSError):
-            continue
-    return ImageFont.load_default()
+            pdfmetrics.registerFont(TTFont(name, path))
+        except Exception:
+            pass
+
+_register_fonts()
+
+F_REGULAR  = "Carlito"
+F_BOLD     = "Carlito-Bold"
+F_ITALIC   = "LiberationSans"
+F_ARIAL_BD = "LiberationSans-Bold"
 
 
-_FONT_LG = _load_font(11)   # número de CRT
-_FONT_MD = _load_font(9)    # campos principales
-_FONT_SM = _load_font(8)    # campos secundarios / combinados
-
-_FONTS = {11: _FONT_LG, 9: _FONT_MD, 8: _FONT_SM}
+def _y(pdf_plumber_top: float) -> float:
+    return PAGE_H - pdf_plumber_top
 
 
-# ---------------------------------------------------------------------------
-# Formateo de valores
-# ---------------------------------------------------------------------------
-
-def _fmt(key: str, value) -> str:
+def _fmt(value) -> str:
     if value is None:
         return ""
     if hasattr(value, "strftime"):
@@ -58,198 +62,235 @@ def _fmt(key: str, value) -> str:
     if isinstance(value, int):
         return "" if value == 0 else str(value)
     text = str(value).strip()
-    if " — " in text:           # selectbox "EXW — Ex Works" → "EXW"
+    if " — " in text:
         text = text.split(" — ")[0]
     return text
 
 
-# ---------------------------------------------------------------------------
-# Mapa de coordenadas — calibrado con cuadrícula sobre pdfplumber
-#
-# Referencia de zonas clave (puntos PDF):
-#   Col izquierda:  x = 52  – 280
-#   Col derecha:    x = 286 – 450
-#   Col angosta:    x = 457 – 560   (campo 12/13/14)
-#   Línea divisoria: x ≈ 283
-#
-#   Cas. 1  Remitente          izq  y = 132 – 173
-#   Cas. 2  Número CRT         der  y = 132 – 173
-#   Cas. 3  Transportista      der  y = 173 – 197
-#   Cas. 4  Destinatario       izq  y = 197 – 236
-#   Cas. 5  Emisión            der  y = 236 – 262   ← solo 1 línea
-#   Cas. 6  Consignatario      izq  y = 262 – 307
-#   Cas. 7  Cargo mercadería   der  y = 264 – 307   ← 2 líneas justas
-#   Cas. 8  Lugar entrega      der  y = 307 – 344
-#   Cas. 11 Descripción        izq  y = 368 – 418   (SON: en y≈390)
-#   Cas. 12 Peso bruto         ang  y = 368 – 418   (Kg Brutos en y≈389)
-#   Cas. 14 Valor/Incoterm     ang  y = 462 – 490   (CFR estaba en y≈473)
-#   Cas. 15 Flete              izq  y = 549 – 588   (ORIGEN/FRONTERA en y≈565)
-#   Cas. 17 Facturas           der  y = 563 – 600
-#   Cas. 18 Instrucciones      der  y = 636 – 695
-# ---------------------------------------------------------------------------
-
-OVERLAY_MAP = [
-    # ── Casilla 1 — Remitente (col. izquierda) ──────────────────────────────
-    {"key": "f_remitente",
-     "tx":  57, "ty": 147, "size": 9,
-     "clear": (52, 138, 280, 163)},
-    {"key": "f_dir_remitente",
-     "tx":  57, "ty": 163, "size": 8,
-     "clear": (52, 161, 280, 173)},
-
-    # ── Casilla 2 — Número CRT (col. derecha) ───────────────────────────────
-    {"key": "f_numero_crt",
-     "tx": 295, "ty": 151, "size": 11,
-     "clear": (286, 138, 560, 173)},
-
-    # ── Casilla 3 — Transportista (col. derecha) ────────────────────────────
-    {"key": "f_transportista",
-     "tx": 295, "ty": 186, "size": 9,
-     "clear": (286, 180, 560, 197)},
-
-    # ── Casilla 4 — Destinatario (col. izquierda) ───────────────────────────
-    {"key": "f_destinatario",
-     "tx":  57, "ty": 207, "size": 9,
-     "clear": (52, 203, 280, 221)},
-    {"key": "f_dir_destinatario",
-     "tx":  57, "ty": 221, "size": 8,
-     "clear": (52, 219, 280, 236)},
-
-    # ── Casilla 5 — Lugar + Fecha de Emisión (col. derecha, 1 sola línea) ───
-    # f_fecha_emision se combina aquí — ver lógica especial en render()
-    {"key": "f_lugar_emision",
-     "tx": 295, "ty": 252, "size": 8,
-     "clear": (286, 244, 560, 263)},
-
-    # ── Casilla 7 — Cargo mercadería: lugar (línea 1) y fecha (línea 2) ─────
-    {"key": "f_lugar_recepcion",
-     "tx": 295, "ty": 286, "size": 9,
-     "clear": (286, 281, 560, 306)},
-    {"key": "f_fecha_documento",
-     "tx": 295, "ty": 298, "size": 8,
-     "clear": None},                   # la clear la cubre el ALWAYS_CLEAR
-
-    # ── Casilla 8 — Lugar de entrega (col. derecha) ─────────────────────────
-    {"key": "f_lugar_entrega",
-     "tx": 295, "ty": 317, "size": 9,
-     "clear": (286, 307, 560, 344)},
-    {"key": "f_fecha_entrega",
-     "tx": 295, "ty": 330, "size": 8,
-     "clear": None},
-
-    # ── Casilla 11 — Descripción de carga (col. izquierda) ──────────────────
-    # "SON:" label está en y≈390; clear sólo desde y=400 para no borrarlo
-    {"key": "f_descripcion",
-     "tx":  57, "ty": 401, "size": 9,
-     "clear": (52, 400, 450, 418)},
-
-    # ── Casilla 12 — Peso bruto (col. angosta) ──────────────────────────────
-    # "Kg Brutos" label está en y≈389; clear sólo desde y=400
-    {"key": "f_peso_bruto",
-     "tx": 461, "ty": 401, "size": 9,
-     "clear": (456, 400, 560, 418)},
-
-    # ── Totales — Peso neto (fila "TOTAL KILOS NETOS:" y≈488) ───────────────
-    {"key": "f_peso_neto",
-     "tx": 130, "ty": 487, "size": 9,
-     "clear": (125, 481, 285, 497)},
-
-    # ── Casilla 14 — Incoterm / Valor (col. angosta, y≈462–490) ────────────
-    {"key": "f_incoterm",
-     "tx": 461, "ty": 471, "size": 9,
-     "clear": (456, 462, 560, 490)},
-
-    # ── Casilla 15 — Flete ORIGEN/FRONTERA (y≈565) ──────────────────────────
-    {"key": "f_flete_usd",
-     "tx": 130, "ty": 563, "size": 9,
-     "clear": (127, 557, 200, 574)},
-
-    # ── Casilla 17 — Número de Factura (junto a "FACTURAS NROS:", y≈576) ────
-    {"key": "f_num_factura",
-     "tx": 451, "ty": 575, "size": 8,
-     "clear": (450, 570, 560, 588)},
-
-    # ── Casilla 18 — Instrucciones de Aduana (col. derecha, y≈648–694) ──────
-    {"key": "f_instrucciones_aduana",
-     "tx": 295, "ty": 651, "size": 8,
-     "clear": (286, 647, 560, 695)},
-]
-
-# Zonas con datos de muestra del template que se limpian SIEMPRE
-_ALWAYS_CLEAR = [
-    (286, 197, 560, 236),   # Dirección portador de muestra (Avda Colon...)
-    (286, 244, 560, 307),   # Datos emisión + cargo de muestra
-    (286, 307, 560, 344),   # Datos entrega de muestra (AEROPUERTO INT...)
-    (286, 647, 560, 695),   # Instrucciones aduana de muestra
-    (127, 557, 200, 588),   # Valores flete de muestra (0.00 USD)
-]
+def _get(form: dict, key: str) -> str:
+    return _fmt(form.get(key))
 
 
-# ---------------------------------------------------------------------------
-# Renderizado base (cacheado)
-# ---------------------------------------------------------------------------
+def _build_overlay(form: dict) -> bytes:
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(PAGE_W, PAGE_H))
+
+    def clear(x0, y0_top, x1, y1_bottom, margin=1):
+        c.setFillColorRGB(1, 1, 1)
+        c.setStrokeColorRGB(1, 1, 1)
+        rl_y0 = _y(y1_bottom) - margin
+        h = (y1_bottom - y0_top) + margin * 2
+        c.rect(x0 - margin, rl_y0, (x1 - x0) + margin * 2, h, fill=1, stroke=0)
+
+    def text(x, y_pl, txt, font=F_REGULAR, size=8.3):
+        if not txt:
+            return
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont(font, size)
+        c.drawString(x, _y(y_pl), txt)
+
+    # Limpiar zonas variables de la plantilla
+    clear(386.0, 143.0, 560.0, 168.0)   # Número CRT
+    clear(348.0, 181.0, 560.0, 196.0)   # Transportista
+    clear(286.0, 196.0, 560.0, 236.0)   # Dirección portador
+    clear(286.0, 243.0, 560.0, 262.0)   # Lugar emisión
+    clear(286.0, 283.0, 560.0, 308.0)   # Lugar recepción
+    clear(286.0, 308.0, 560.0, 355.0)   # Lugar entrega / notificar
+    clear(460.0, 463.0, 560.0, 485.0)   # Valor/Incoterm
+    clear(125.0, 469.0, 290.0, 512.0)   # Totales
+    clear(412.0, 538.0, 560.0, 556.0)   # Declaración valor
+    clear(147.0, 558.0, 186.0, 574.0)   # Flete origen 0.00
+    clear(147.0, 570.0, 186.0, 585.0)   # Flete frontera 0.00
+    clear(140.0, 620.0, 168.0, 638.0)   # Total flete
+    clear(449.0, 580.0, 560.0, 622.0)   # Docs anexos números
+    clear(286.0, 653.0, 560.0, 692.0)   # Instrucciones aduana
+    clear(444.0, 746.0, 560.0, 762.0)   # Conductor valor
+    clear(415.0, 762.0, 424.0, 780.0)   # Patente camión valor
+    clear(497.0, 762.0, 560.0, 780.0)   # Patente rampla valor
+    clear(170.0, 747.0, 235.0, 762.0)   # Fecha firma remitente
+    clear(170.0, 877.0, 235.0, 893.0)   # Fecha firma transportista
+
+    # Casilla 1 — Remitente
+    text(116.8, 148.0, _get(form, "f_remitente"), font=F_REGULAR, size=9.2)
+    dir_rem = _get(form, "f_dir_remitente")
+    if "\n" in dir_rem:
+        parts = dir_rem.split("\n", 1)
+        text(128.8, 162.0, parts[0].strip(), font=F_REGULAR, size=8.3)
+        text(126.7, 174.0, parts[1].strip(), font=F_REGULAR, size=8.3)
+    elif dir_rem:
+        text(128.8, 162.0, dir_rem, font=F_REGULAR, size=8.3)
+
+    # Casilla 2 — Número CRT
+    text(386.5, 153.0, _get(form, "f_numero_crt"), font=F_BOLD, size=11.9)
+
+    # Casilla 3 — Transportista
+    text(361.8, 186.0, _get(form, "f_transportista"), font=F_ITALIC, size=8.3)
+
+    # Casilla 4 — Destinatario
+    text(139.4, 214.0, _get(form, "f_destinatario"),     font=F_REGULAR, size=8.3)
+    text(85.7,  227.0, _get(form, "f_dir_destinatario"), font=F_REGULAR, size=7.3)
+
+    # Casilla 5 — Lugar Emisión
+    text(380.1, 250.0, _get(form, "f_lugar_emision"), font=F_REGULAR, size=8.3)
+
+    # Casilla 6 — Consignatario
+    text(136.5, 276.0, _get(form, "f_consignatario"),     font=F_REGULAR, size=9.2)
+    text(85.7,  290.0, _get(form, "f_dir_consignatario"), font=F_REGULAR, size=7.3)
+
+    # Casilla 7 — Lugar y fecha recepción
+    lugar_rec = _get(form, "f_lugar_recepcion")
+    fecha_doc = _get(form, "f_fecha_documento")
+    recepcion = "  ".join(filter(None, [lugar_rec, fecha_doc]))
+    text(356.8, 290.0, recepcion, font=F_REGULAR, size=8.3)
+
+    # Casilla 8 — Lugar entrega
+    text(341.3, 318.0, _get(form, "f_lugar_entrega"), font=F_REGULAR, size=8.3)
+
+    # Casilla 9 — Notificar a
+    text(139.4, 332.0, _get(form, "f_notificar"),     font=F_REGULAR, size=8.3)
+    text(372.4, 333.0, _get(form, "f_destino_final"), font=F_REGULAR, size=7.3)
+    text(95.6,  345.0, _get(form, "f_dir_notificar"), font=F_REGULAR, size=6.4)
+
+    # Casilla 11 — Descripción de carga
+    desc1    = _get(form, "f_descripcion_1")
+    kn1      = _get(form, "f_kilos_netos_1")
+    desc2    = _get(form, "f_descripcion_2")
+    kn2      = _get(form, "f_kilos_netos_2")
+    desc_gen = _get(form, "f_descripcion")
+
+    if desc1:
+        text(60.8, 402.0, desc1, font=F_BOLD, size=7.3)
+        if kn1:
+            text(60.8, 417.0, f"CON: {kn1} KILOS NETOS", font=F_REGULAR, size=7.3)
+    if desc2:
+        text(60.8, 431.0, desc2, font=F_BOLD, size=7.3)
+        if kn2:
+            text(60.8, 446.0, f"CON: {kn2} KILOS NETOS", font=F_REGULAR, size=7.3)
+    if not desc1 and not desc2 and desc_gen:
+        for i, line in enumerate(desc_gen.split("\n")[:4]):
+            text(60.8, 402.0 + i * 15.0, line.strip(), font=F_BOLD, size=7.3)
+
+    # Casilla 12 — Peso bruto
+    pb = _get(form, "f_peso_bruto")
+    if pb:
+        text(472.6, 389.0, pb, font=F_REGULAR, size=9.2)
+
+    # Totales (solo valores; labels ya están en la plantilla)
+    total_cajas = _get(form, "f_total_cajas")
+    total_kn    = _get(form, "f_peso_neto")
+    total_kb    = _get(form, "f_peso_bruto")
+    if total_cajas:
+        text(130.0, 475.0, total_cajas, font=F_BOLD, size=7.3)
+    if total_kn:
+        text(130.0, 488.0, total_kn,   font=F_BOLD, size=7.3)
+    if total_kb:
+        text(130.0, 501.0, total_kb,   font=F_BOLD, size=7.3)
+
+    # Casilla 14 — Valor / Incoterm
+    valor = _get(form, "f_valor_mercaderia")
+    inco  = _get(form, "f_incoterm")
+    val_str = "  ".join(filter(None, [valor, inco]))
+    if val_str:
+        text(482.5, 473.0, val_str, font=F_REGULAR, size=9.2)
+
+    # Casilla 16 — Declaración valor
+    val_mer = _get(form, "f_valor_mercaderia")
+    if val_mer:
+        text(412.5, 544.0, val_mer, font=F_REGULAR, size=9.2)
+
+    # Casilla 15 — Flete
+    flete_orig = _get(form, "f_flete_origen")
+    flete_fron = _get(form, "f_flete_frontera")
+    flete_tot  = _get(form, "f_flete_usd")
+    if flete_orig:
+        text(135.5, 564.0, flete_orig, font=F_REGULAR, size=8.3)
+        text(170.0, 564.0, "USD",      font=F_REGULAR, size=8.3)
+    if flete_fron:
+        text(130.0, 576.0, flete_fron, font=F_REGULAR, size=8.3)
+        text(170.0, 576.0, "USD",      font=F_REGULAR, size=8.3)
+    if flete_tot:
+        text(145.9, 627.0, flete_tot, font=F_REGULAR, size=8.3)
+
+    # Casilla 17 — Documentos anexos
+    facturas = _get(form, "f_num_factura")
+    guias    = _get(form, "f_guias_despacho")
+    cert_san = _get(form, "f_cert_sanitario")
+    if facturas:
+        text(450.0, 587.0, facturas,  font=F_REGULAR, size=7.3)
+    if guias:
+        text(450.0, 598.0, guias,     font=F_REGULAR, size=7.3)
+    if cert_san:
+        text(450.0, 609.0, cert_san,  font=F_REGULAR, size=7.3)
+
+    # Casilla 18 — Instrucciones aduana
+    instrucciones = _get(form, "f_instrucciones_aduana")
+    if instrucciones:
+        for i, line in enumerate(instrucciones.split("\n")[:3]):
+            text(322.2, [660.0, 672.0, 682.0][i], line.strip(), font=F_REGULAR, size=6.4)
+
+    # Casilla 21 — Fecha firma remitente
+    fecha_emision = _get(form, "f_fecha_emision")
+    if fecha_emision:
+        text(171.5, 753.0, fecha_emision, font=F_BOLD, size=8.3)
+
+    # Casilla 22 — Conductor y patentes
+    conductor  = _get(form, "f_conductor")
+    pat_camion = _get(form, "f_patente_camion")
+    pat_rampla = _get(form, "f_patente_rampla")
+    if conductor:
+        text(445.0, 753.0, conductor,  font=F_BOLD, size=7.3)
+    if pat_camion:
+        text(416.0, 769.0, pat_camion, font=F_BOLD, size=7.3)
+    if pat_rampla:
+        text(498.0, 769.0, pat_rampla, font=F_BOLD, size=7.3)
+
+    # Casilla 24 — Destinatario firma
+    text(395.7, 820.0, _get(form, "f_destinatario"), font=F_REGULAR, size=8.3)
+
+    # Casilla 23 — Fecha firma transportista
+    if fecha_emision:
+        text(171.8, 883.0, fecha_emision, font=F_BOLD, size=8.3)
+
+    c.save()
+    buf.seek(0)
+    return buf.read()
+
 
 @st.cache_data(show_spinner=False)
-def _render_base_png() -> Optional[bytes]:
-    """PNG de la plantilla en bruto. Se genera una vez por sesión."""
+def _load_template_bytes() -> Optional[bytes]:
     if not PDF_TEMPLATE_PATH.exists():
         return None
-    doc = pdfium.PdfDocument(str(PDF_TEMPLATE_PATH))
-    bitmap = doc[0].render(scale=RENDER_SCALE)
-    buf = io.BytesIO()
-    bitmap.to_pil().save(buf, format="PNG")
-    return buf.getvalue()
+    return PDF_TEMPLATE_PATH.read_bytes()
 
 
-# ---------------------------------------------------------------------------
-# Renderizado con overlay
-# ---------------------------------------------------------------------------
-
-def render_pdf_with_overlay(form_data: dict) -> Optional[bytes]:
-    """
-    PNG de la plantilla CRT con los valores del formulario superpuestos.
-    Se regenera en cada rerun de Streamlit (no cacheado).
-    """
-    base_bytes = _render_base_png()
-    if base_bytes is None:
+def generate_crt_pdf(form_data: dict) -> Optional[bytes]:
+    """Genera el PDF final fusionando plantilla + overlay. Devuelve bytes para descarga."""
+    template_bytes = _load_template_bytes()
+    if template_bytes is None:
         return None
+    overlay_bytes = _build_overlay(form_data)
+    template_reader = PdfReader(io.BytesIO(template_bytes))
+    overlay_reader  = PdfReader(io.BytesIO(overlay_bytes))
+    writer = PdfWriter()
+    base_page = template_reader.pages[0]
+    base_page.merge_page(overlay_reader.pages[0])
+    writer.add_page(base_page)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
-    img = Image.open(io.BytesIO(base_bytes)).copy()
-    draw = ImageDraw.Draw(img)
-    s = RENDER_SCALE
-    WHITE = (255, 255, 255)
-    INK   = (15, 15, 15)
 
-    # ── Paso 1: limpiar zonas con datos de muestra ───────────────────────────
-    for rect in _ALWAYS_CLEAR:
-        draw.rectangle([int(c * s) for c in (rect[0], rect[1], rect[2], rect[3])],
-                       fill=WHITE)
-
-    # ── Paso 2: limpiar + dibujar cada campo mapeado ─────────────────────────
-    for entry in OVERLAY_MAP:
-        if entry["clear"]:
-            x0, y0, x1, y1 = [int(c * s) for c in entry["clear"]]
-            draw.rectangle([x0, y0, x1, y1], fill=WHITE)
-
-        text = _fmt(entry["key"], form_data.get(entry["key"]))
-        if not text:
-            continue
-
-        font = _FONTS.get(entry["size"], _FONT_MD)
-        draw.text((int(entry["tx"] * s), int(entry["ty"] * s)),
-                  text, fill=INK, font=font)
-
-    # ── Paso 3: lógica especial — Casilla 5 combina lugar + fecha ────────────
-    # El bloque 5 tiene solo ~18 pts de alto; caben en una línea combinada.
-    lugar_em = _fmt("f_lugar_emision", form_data.get("f_lugar_emision"))
-    fecha_em = _fmt("f_fecha_emision", form_data.get("f_fecha_emision"))
-    combined_5 = "  |  ".join(filter(None, [lugar_em, fecha_em]))
-    if combined_5:
-        # Reemplaza el texto de lugar_emision ya dibujado con la versión combinada
-        # (el clear ya se hizo en el OVERLAY_MAP de f_lugar_emision)
-        draw.text((int(295 * s), int(252 * s)), combined_5,
-                  fill=INK, font=_FONT_SM)
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+def render_pdf_preview(form_data: dict) -> Optional[bytes]:
+    """Renderiza el PDF como PNG para la vista previa en Streamlit."""
+    pdf_bytes = generate_crt_pdf(form_data)
+    if pdf_bytes is None:
+        return None
+    try:
+        import pypdfium2 as pdfium
+        doc    = pdfium.PdfDocument(pdf_bytes)
+        bitmap = doc[0].render(scale=2.0)
+        buf    = io.BytesIO()
+        bitmap.to_pil().save(buf, format="PNG")
+        return buf.getvalue()
+    except ImportError:
+        return pdf_bytes

@@ -265,6 +265,7 @@ def _load_template_bytes() -> Optional[bytes]:
 
 def generate_crt_pdf(form_data: dict) -> Optional[bytes]:
     """Genera el PDF final fusionando plantilla + overlay. Devuelve bytes para descarga."""
+    assert isinstance(form_data, dict), "form_data debe ser dict, no None"
     template_bytes = _load_template_bytes()
     if template_bytes is None:
         return None
@@ -280,6 +281,7 @@ def generate_crt_pdf(form_data: dict) -> Optional[bytes]:
     return out.getvalue()
 
 
+# Deprecated — el frontend Dash usa generate_crt_pdf() + iframe base64
 def render_pdf_preview(form_data: dict) -> Optional[bytes]:
     """Renderiza el PDF como PNG para la vista previa en Streamlit."""
     pdf_bytes = generate_crt_pdf(form_data)

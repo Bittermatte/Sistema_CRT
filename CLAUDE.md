@@ -62,6 +62,17 @@ Every widget interaction triggers a Streamlit rerun. `app.py` reads `st.session_
 
 Stub files exist for Phase 2–3 features: `src/services/db_service.py`, `src/services/customs_service.py`, `src/api/routes.py`, and stub pages `buscar`, `historial`, `modificar`, `mic_aduana`, `configuracion`.
 
+## Estado de la Transición
+
+- `app_dash.py` → entry point activo (Dash, puerto 8051)
+- `app.py` → legacy Streamlit, conservado como referencia durante transición
+- `src/ui/` → código Streamlit legacy, no activo
+- `src/dash_ui/` → frontend activo
+- `modulos/creador_crt.py` → generador PDF legacy (referencia de coordenadas)
+- `src/services/pdf_service.py` → generador PDF canónico activo
+- `src/models/crt.py` → reservado para Fase 2 (validación con BD)
+- `src/services/db_service.py`, `customs_service.py`, `src/api/routes.py` → stubs Fase 2/3
+
 ### Business rules (Phase 1 scope)
 
 - **Freight proration (Casilla 15)**: `flete_usd = (peso_bruto_CRT × tarifa) / peso_bruto_camión`. Tariffs: Puerto Natales 4,400 USD | Punta Arenas 4,250 USD.

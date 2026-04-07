@@ -26,19 +26,50 @@ PDF_TEMPLATE_PATH = Path("plantillas/crt_blanco.pdf")
 PAGE_W = 612.0
 PAGE_H = 1008.0
 
-_FONT_PATHS = {
-    "Carlito":             "/usr/share/fonts/truetype/crosextra/Carlito-Regular.ttf",
-    "Carlito-Bold":        "/usr/share/fonts/truetype/crosextra/Carlito-Bold.ttf",
-    "LiberationSans":      "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    "LiberationSans-Bold": "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+def _find_font(candidates: list) -> str | None:
+    """Retorna la primera ruta de la lista que exista en el sistema."""
+    for path in candidates:
+        if Path(path).exists():
+            return path
+    return None
+
+_FONT_CANDIDATES = {
+    "Carlito": [
+        # Linux
+        "/usr/share/fonts/truetype/crosextra/Carlito-Regular.ttf",
+        # macOS — Calibri nativo o Arial como fallback
+        "/System/Library/Fonts/Supplemental/Calibri.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+    ],
+    "Carlito-Bold": [
+        "/usr/share/fonts/truetype/crosextra/Carlito-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Calibri Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+    ],
+    "LiberationSans": [
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+    ],
+    "LiberationSans-Bold": [
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+    ],
 }
 
 def _register_fonts():
-    for name, path in _FONT_PATHS.items():
-        try:
-            pdfmetrics.registerFont(TTFont(name, path))
-        except Exception:
-            pass
+    for name, candidates in _FONT_CANDIDATES.items():
+        path = _find_font(candidates)
+        if path:
+            try:
+                pdfmetrics.registerFont(TTFont(name, path))
+            except Exception as e:
+                print(f"[pdf_service] Advertencia: no se pudo registrar {name} desde {path}: {e}")
+        else:
+            print(f"[pdf_service] Advertencia: no se encontró fuente para '{name}' en ninguna ruta candidata")
 
 _register_fonts()
 
@@ -263,22 +294,51 @@ def _load_template_bytes() -> Optional[bytes]:
     return PDF_TEMPLATE_PATH.read_bytes()
 
 
+# DEPRECATED — reemplazada por pdf_builder. Conservada como referencia.
+# def generate_crt_pdf(form_data: dict) -> Optional[bytes]:
+#     """Genera el PDF final fusionando plantilla + overlay."""
+#     assert isinstance(form_data, dict)
+#     template_bytes = _load_template_bytes()
+#     if template_bytes is None:
+#         return None
+#     overlay_bytes = _build_overlay(form_data)
+#     template_reader = PdfReader(io.BytesIO(template_bytes))
+#     overlay_reader  = PdfReader(io.BytesIO(overlay_bytes))
+#     writer = PdfWriter()
+#     overlay_page = overlay_reader.pages[0]
+#     overlay_page.merge_page(template_reader.pages[0])
+#     writer.add_page(overlay_page)
+#     out = io.BytesIO()
+#     writer.write(out)
+#     return out.getvalue()
+
+
+# Nuevo generador (desde cero, sin merge)
+from src.services.pdf_builder import build_crt_pdf
+
 def generate_crt_pdf(form_data: dict) -> Optional[bytes]:
-    """Genera el PDF final fusionando plantilla + overlay. Devuelve bytes para descarga."""
+    """
+    Genera el PDF CRT. Usa Excel+LibreOffice si está disponible,
+    sino cae al builder ReportLab como fallback.
+    """
     assert isinstance(form_data, dict), "form_data debe ser dict, no None"
-    template_bytes = _load_template_bytes()
-    if template_bytes is None:
+
+    # Intentar con Excel (resultado idéntico al original)
+    try:
+        from src.services.excel_pdf_builder import generate_crt_pdf_from_excel, _find_soffice
+        if _find_soffice():
+            result = generate_crt_pdf_from_excel(form_data)
+            if result:
+                return result
+    except Exception as e:
+        print(f"[pdf_service] Excel builder falló: {e}, usando fallback ReportLab")
+
+    # Fallback: ReportLab (coordenadas aproximadas)
+    try:
+        return build_crt_pdf(form_data)
+    except Exception as e:
+        print(f"[pdf_service] ReportLab builder falló: {e}")
         return None
-    overlay_bytes = _build_overlay(form_data)
-    template_reader = PdfReader(io.BytesIO(template_bytes))
-    overlay_reader  = PdfReader(io.BytesIO(overlay_bytes))
-    writer = PdfWriter()
-    base_page = template_reader.pages[0]
-    base_page.merge_page(overlay_reader.pages[0])
-    writer.add_page(base_page)
-    out = io.BytesIO()
-    writer.write(out)
-    return out.getvalue()
 
 
 # Deprecated — el frontend Dash usa generate_crt_pdf() + iframe base64

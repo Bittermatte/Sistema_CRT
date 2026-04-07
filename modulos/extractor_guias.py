@@ -1,187 +1,244 @@
-"""
-Módulo 2 — Extractor de datos desde Guías de Despacho Electrónica en PDF.
-Usa pdfplumber + regex para leer el detalle de la carga logística.
-"""
-
 import re
 import pdfplumber
+from typing import Optional
+
+# ── Patrones reales extraídos de 3.198 CRTs históricos ───────────────────────
+
+# Número de guía — 5 variantes reales encontradas
+PATRONES_GUIA = [
+    r"GUIAS?\s+DE\s+DESPACHO\s+NROS?\s*[.:]\s*([\d,\s\.]+)",
+    r"GUIAS?\s+DE\s+DESPACHO\s*[.:]\s*([\d,\s\.]+)",
+    r"GUIA\s+DE\s+DESPACHO\s+NRO?\s*[.:]\s*([\d,\s\.]+)",
+    r"GUIA\s+DE\s+DESPACHO\s*[.:]\s*([\d]+)",
+    r"N[°º]\s+DE\s+GUIA\s*[.:]\s*([\d]+)",
+    # Formato SII: "Nº 497318\nS.I.I."
+    r"N[°º]\s+(\d+)\s*\n\s*S\.I\.I\.",
+]
+
+# Peso bruto — variantes reales
+PATRONES_PESO_BRUTO = [
+    r"PESO\s+BRUTO\s*:\s*([\d.,]+)\s+Son:",   # formato SII estándar
+    r"PESO\s+BRUTO\s*[.:]\s*([\d.,]+)\s*(?:KG|KILOS?)?",
+    r"BRUTO\s*[.:]\s*([\d.,]+)\s*(?:KG|KILOS?)?",
+    r"GROSS\s+WEIGHT\s*[.:]\s*([\d.,]+)",
+    r"P\.?\s*BRUTO\s*[.:]\s*([\d.,]+)",
+]
+
+# Peso neto
+PATRONES_PESO_NETO = [
+    r"PESO\s+NETO\s*:\s*([\d.,]+)\s+Son:",    # formato SII estándar
+    r"PESO\s+NETO\s*[.:]\s*([\d.,]+)\s*(?:KG|KILOS?)?",
+    r"NET\s+WEIGHT\s*[.:]\s*([\d.,]+)",
+    r"P\.?\s*NETO\s*[.:]\s*([\d.,]+)",
+]
+
+# Bultos/cajas
+PATRONES_BULTOS = [
+    r"CANTIDAD\s+DE\s+BULTOS\s*:\s*([\d.,]+)\s+Son:",  # formato SII estándar
+    r"BULTOS\s*[.:]\s*(\d+)",
+    r"TOTAL\s+CAJAS\s*[.:]\s*(\d+)",
+    r"N[°º]\s+BULTOS\s*[.:]\s*(\d+)",
+    r"CANTIDAD\s+BULTOS\s*[.:]\s*(\d+)",
+    r"(\d+)\s+CAJAS",
+]
+
+# Patente — formato chileno nuevo (AB123CD), viejo (AB1234) y argentino (AB123CD)
+PATRON_PATENTE_TRACTO = [
+    r"CAM[IÍ][OÓ]N\s+PATENTE(.*?)HORA\s+LLEGADA",  # bloque SII con dos placas
+    r"PATENTE\s+(?:CAMION|TRACTO|TRACTOR)\s*[.:/]\s*([A-Z]{2,3}\d{3,4}[A-Z]{0,2})",
+    r"TRACTO\s*[.:/]\s*([A-Z]{2,3}\d{3,4}[A-Z]{0,2})",
+    r"CAMION\s*[.:/]\s*([A-Z]{2,3}\d{3,4}[A-Z]{0,2})",
+]
+
+PATRON_PATENTE_SEMI = [
+    r"PATENTE\s+(?:RAMPLA|SEMI|REMOLQUE)\s*[.:/]\s*([A-Z]{2,3}\d{3,4}[A-Z]{0,2})",
+    r"RAMPLA\s*[.:/]\s*([A-Z]{2,3}\d{3,4}[A-Z]{0,2})",
+    r"SEMI\s*[.:/]\s*([A-Z]{2,3}\d{3,4}[A-Z]{0,2})",
+]
+
+# Conductor
+PATRONES_CONDUCTOR = [
+    r"CONDUCTOR\s*[.:/]\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑa-záéíóúñ\s]+?)(?:\n|PATENTE|RUT|DNI|$)",
+    r"CHOFER\s*[.:/]\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑa-záéíóúñ\s]+?)(?:\n|PATENTE|RUT|$)",
+    r"TRANSPORTISTA\s*[.:/]\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑa-záéíóúñ\s]+?)(?:\n|PATENTE|$)",
+]
+
+# Certificado sanitario / Codaut / RUCE / NEPPEX
+PATRONES_CERT = [
+    r"CERTIFICADO\s+SANITARIO\s*(?:NRO?|N[°º])\s*[.:/]?\s*(\d+)",
+    r"CERT(?:IFICADO)?\s+SANITARIO\s*[.:/]\s*(\d+)",
+    r"N[°º]\s+CODAUT\s*[.:/]\s*(\d+)",
+    r"CODAUT\s*[.:/]\s*(\d+)",
+    r"N[°º]\s+RUCE\s*[.:/]\s*(\d+)",
+    r"RUCE\s*/\s*NEPPEX\s*[.:/]\s*(\d+)",
+    r"NEPPEX\s*[.:/]\s*(\d+)",
+]
+
+# Destinatario
+PATRONES_DESTINATARIO = [
+    r"DESTINATARIO\s*[.:/]\s*(.+?)(?:\n|DIRECCION|DIR\.|RUT)",
+    r"CONSIGNATARIO\s*[.:/]\s*(.+?)(?:\n|DIRECCION)",
+    r"CLIENTE\s*[.:/]\s*(.+?)(?:\n|RUT|DIRECCION)",
+]
+
+# Orden de venta / referencia cruzada con la factura — por pesquera
+# El número extraído aquí debe coincidir con ref_pedido en la factura
+PATRONES_ORDEN_VENTA_PESQUERA = {
+    # Multi X: guía dice "N° Pedido: 12345" — factura dice "PV: 12345"
+    "multix":           [r"N[°º]\s*PEDIDO\s*[.:]\s*(\d+)"],
+    # AquaChile: guía dice "PEDIDO EXPORTACION 12345"
+    "aquachile":        [r"PEDIDO\s+EXPORTACION\s*[.:/]?\s*(\d+)"],
+    # Blumar: guía dice "PO: 12345"
+    "blumar":           [r"PO\s*[.:]\s*(\d+)"],
+    "blumar_magallanes":[r"PO\s*[.:]\s*(\d+)"],
+    # Cermaq: guía dice "CO - CLIENTE: 12345 TEXTO" — solo el número
+    "cermaq":           [r"CO\s*[-\u2013]\s*CLIENTE\s*[.:]\s*(\d+)"],
+    # Australis: fallback genérico (sin patrón específico conocido aún)
+    "australis":        [r"ORDEN\s+(?:DE\s+)?VENTA\s*[.:/]\s*(\d+)",
+                         r"PURCHASE\s+ORDER\s*[.:/]?\s*(?:N[°º])?\s*(\d+)"],
+}
+
+# Fallback genérico cuando la pesquera no tiene patrón específico
+PATRONES_ORDEN_VENTA_GENERICO = [
+    r"ORDEN\s+DE\s+VENTA\s*[.:/]\s*(\d+)",
+    r"N[°º]\s*\.?\s*ORDEN\s+(?:DE\s+)?VENTA\s*[.:/]\s*(\d+)",
+    r"PURCHASE\s+ORDER\s*[.:/]?\s*(?:N[°º])?\s*(\d+)",
+    r"P\.?O\.?\s*[.:]\s*(\d+)",
+]
 
 
-def _limpiar_numero(valor: str) -> float:
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _limpiar_numeros(texto: str) -> str:
+    """Extrae y limpia lista de números: '545178, 545179' → '545178, 545179'"""
+    if not texto:
+        return ""
+    nums = re.findall(r'\d+', texto)
+    return ", ".join(nums) if nums else ""
+
+
+def _primera_coincidencia(texto: str, patrones: list) -> Optional[str]:
+    """Prueba lista de patrones y retorna la primera coincidencia limpia."""
+    for patron in patrones:
+        m = re.search(patron, texto, re.IGNORECASE | re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _extraer_float(texto: str) -> Optional[float]:
+    """Convierte '1.234,56' o '1234.56' a float."""
+    if not texto:
+        return None
+    # Formato chileno: punto miles, coma decimal
+    t = texto.replace(".", "").replace(",", ".")
+    try:
+        return float(t)
+    except ValueError:
+        pass
+    # Formato anglosajón
+    try:
+        return float(texto.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _extraer_patentes_sii(texto: str) -> tuple[Optional[str], Optional[str]]:
     """
-    Convierte un número en formato chileno (1.827,48) a float (1827.48).
-    Elimina los puntos de miles y reemplaza la coma decimal por punto.
+    Extrae tracto y semi del bloque SII 'CAMIÓN PATENTE … HORA LLEGADA'.
+    Reconoce formato chileno (AB123CD) y argentino (AB1234 / AB123CD).
     """
-    return float(valor.replace(".", "").replace(",", "."))
-
-
-def extraer_datos_guia(ruta_pdf: str) -> dict:
-    """
-    Abre un PDF de Guía de Despacho y extrae 5 campos logísticos clave.
-
-    Retorna un diccionario con las claves:
-        numero_guia  — número de la guía (int)
-        bultos       — cantidad de bultos (int)
-        peso_neto    — peso neto en kg (float)
-        peso_bruto   — peso bruto en kg (float)
-        productos    — bloque de texto de la tabla de productos (str)
-    """
-    with pdfplumber.open(ruta_pdf) as pdf:
-        texto = "\n".join(
-            pagina.extract_text() or "" for pagina in pdf.pages
-        )
-
-    # ── N° Guía ───────────────────────────────────────────────────────────────
-    # Aparece como "Nº 497318" después del encabezado "GUIA DE DESPACHO ... ELECTRONICA"
-    numero_guia = None
-    m = re.search(r"N[°º]\s+(\d+)\s*\n\s*S\.I\.I\.", texto, re.IGNORECASE)
-    if m:
-        numero_guia = int(m.group(1))
-
-    # ── Bultos ────────────────────────────────────────────────────────────────
-    # "CANTIDAD DE BULTOS : 90 Son:"
-    bultos = None
-    m = re.search(
-        r"CANTIDAD\s+DE\s+BULTOS\s*:\s*([\d.,]+)\s+Son:",
-        texto,
-        re.IGNORECASE,
-    )
-    if m:
-        bultos = int(_limpiar_numero(m.group(1)))
-
-    # ── Peso Neto ─────────────────────────────────────────────────────────────
-    # "PESO NETO : 1.827,48 Son:"
-    peso_neto = None
-    m = re.search(
-        r"PESO\s+NETO\s*:\s*([\d.,]+)\s+Son:",
-        texto,
-        re.IGNORECASE,
-    )
-    if m:
-        peso_neto = _limpiar_numero(m.group(1))
-
-    # ── Peso Bruto ────────────────────────────────────────────────────────────
-    # "PESO BRUTO : 2.189,19 Son:"
-    peso_bruto = None
-    m = re.search(
-        r"PESO\s+BRUTO\s*:\s*([\d.,]+)\s+Son:",
-        texto,
-        re.IGNORECASE,
-    )
-    if m:
-        peso_bruto = _limpiar_numero(m.group(1))
-
-    # ── Patentes (tracto y semi) ──────────────────────────────────────────────
-    # El bloque entre "CAMIÓN PATENTE" y "HORA LLEGADA" contiene ambas placas
-    # en formato chileno AA999AA. La primera es el tracto, la segunda el semi.
-    patente_tracto = patente_semi = None
     m = re.search(
         r"CAM[IÍ][OÓ]N\s+PATENTE(.*?)HORA\s+LLEGADA",
         texto,
         re.IGNORECASE | re.DOTALL,
     )
     if m:
-        placas = re.findall(r"\b([A-Z]{2}\d{3}[A-Z]{2})\b", m.group(1))
-        patente_tracto = placas[0] if len(placas) > 0 else None
-        patente_semi   = placas[1] if len(placas) > 1 else None
-
-    # ── Productos ─────────────────────────────────────────────────────────────
-    # Captura el bloque entre la fila de encabezados de la tabla y el pie
-    # "No constituye Venta." (o "TOTAL :" como fallback).
-    productos = None
-    for fin in [r"No\s+constituye\s+Venta\.", r"TOTAL\s*:"]:
-        m = re.search(
-            rf"CODIGO\s+PRODUCTOS\s+KILOS\s+CAJAS\s+P\.\s*UNITARIO\s+TOTAL\s*(.*?)\s*{fin}",
-            texto,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if m:
-            bloque = m.group(1)
-            # Colapsar saltos de línea en espacios y limpiar bordes
-            productos = re.sub(r"\s*\n\s*", " | ", bloque.strip())
-            break
-
-    return {
-        "numero_guia": numero_guia,
-        "bultos": bultos,
-        "peso_neto": peso_neto,
-        "peso_bruto": peso_bruto,
-        "patente_tracto": patente_tracto,
-        "patente_semi": patente_semi,
-        "productos": agrupar_familias_aquachile(productos) if productos else [],
-    }
+        placas = re.findall(r"\b([A-Z]{2,3}\d{3,4}[A-Z]{0,2})\b", m.group(1))
+        tracto = placas[0] if len(placas) > 0 else None
+        semi   = placas[1] if len(placas) > 1 else None
+        return tracto, semi
+    return None, None
 
 
-def agrupar_familias_aquachile(texto_bruto: str) -> list:
+# ── Extractor principal ───────────────────────────────────────────────────────
+
+def extraer_datos_guia(pdf_path: str) -> Optional[dict]:
     """
-    Recibe el bloque de texto de la tabla de productos (separado por ' | ')
-    y agrupa las líneas por familia, sumando cajas y kilos.
-
-    Familias reconocidas:
-        - 'ENTERO SIN VISCERAS/HON'  → líneas que contienen esa cadena
-        - 'FILETE Premium'           → líneas que contienen 'FILETE'
-
-    Retorna una lista de dicts:
-        [{"familia": str, "cajas_totales": int, "kilos_totales": float}, ...]
+    Extrae datos de una guía de despacho.
+    Retorna dict con campos normalizados o None si falla.
     """
-    acumulado: dict = {}
-    familia_activa = None
+    try:
+        texto = ""
+        with pdfplumber.open(pdf_path) as pdf:
+            texto = "\n".join(p.extract_text() or "" for p in pdf.pages)
 
-    for segmento in texto_bruto.split(" | "):
-        seg = segmento.strip()
-        seg_upper = seg.upper()
+        if not texto.strip():
+            return None
 
-        # ── Detectar a qué familia pertenece el siguiente bloque de datos ──
-        if "ENTERO SIN VISCERAS" in seg_upper:
-            familia_activa = "ENTERO SIN VISCERAS/HON"
-        elif "FILETE" in seg_upper:
-            familia_activa = "FILETE Premium"
+        texto_up = texto.upper()
 
-        # ── Detectar fila de datos: "CODIGO SALMO SALAR <kilos> <cajas> ..." ─
-        m = re.search(r"SALMO\s+SALAR\s+([\d.,]+)\s+(\d+)", seg, re.IGNORECASE)
-        if m and familia_activa:
-            kilos = _limpiar_numero(m.group(1))
-            cajas = int(m.group(2))
-            if familia_activa not in acumulado:
-                acumulado[familia_activa] = {"kilos": 0.0, "cajas": 0}
-            acumulado[familia_activa]["kilos"] += kilos
-            acumulado[familia_activa]["cajas"] += cajas
+        # Número de guía
+        raw_guia    = _primera_coincidencia(texto_up, PATRONES_GUIA)
+        numero_guia = _limpiar_numeros(raw_guia) if raw_guia else None
 
-    return [
-        {
-            "familia": fam,
-            "cajas_totales": vals["cajas"],
-            "kilos_totales": round(vals["kilos"], 2),
+        # Pesos
+        raw_pb     = _primera_coincidencia(texto_up, PATRONES_PESO_BRUTO)
+        raw_pn     = _primera_coincidencia(texto_up, PATRONES_PESO_NETO)
+        peso_bruto = _extraer_float(raw_pb)
+        peso_neto  = _extraer_float(raw_pn)
+
+        # Bultos
+        raw_bultos = _primera_coincidencia(texto_up, PATRONES_BULTOS)
+        bultos = int(_extraer_float(raw_bultos) or 0) if raw_bultos else None
+        if bultos == 0:
+            bultos = None
+
+        # Patentes — intentar bloque SII primero, luego patrones individuales
+        patente_tracto, patente_semi = _extraer_patentes_sii(texto_up)
+        if not patente_tracto:
+            patente_tracto = _primera_coincidencia(texto_up, PATRON_PATENTE_TRACTO[1:])
+        if not patente_semi:
+            patente_semi = _primera_coincidencia(texto_up, PATRON_PATENTE_SEMI)
+
+        # Conductor
+        raw_cond  = _primera_coincidencia(texto, PATRONES_CONDUCTOR)
+        conductor = raw_cond.strip().upper() if raw_cond else None
+
+        # Certificado sanitario / Codaut
+        raw_cert       = _primera_coincidencia(texto_up, PATRONES_CERT)
+        cert_sanitario = raw_cert.strip() if raw_cert else None
+
+        # Destinatario
+        raw_dest     = _primera_coincidencia(texto, PATRONES_DESTINATARIO)
+        destinatario = raw_dest.strip() if raw_dest else None
+
+        # Detectar pesquera primero — necesario para elegir el patrón correcto
+        from modulos.config_cliente import detectar_pesquera
+        pesquera = detectar_pesquera(texto_up)
+
+        # Orden de venta — patrón específico por pesquera, luego fallback genérico
+        patrones_ov = (PATRONES_ORDEN_VENTA_PESQUERA.get(pesquera) or []) + PATRONES_ORDEN_VENTA_GENERICO
+        raw_ov      = _primera_coincidencia(texto_up, patrones_ov)
+        orden_venta = raw_ov.strip() if raw_ov else None
+
+        return {
+            "tipo":           "guia",
+            "pesquera":       pesquera,
+            "numero_guia":    numero_guia,
+            "orden_venta":    orden_venta,
+            "peso_bruto":     peso_bruto,
+            "peso_neto":      peso_neto,
+            "bultos":         bultos,
+            "patente_tracto": patente_tracto,
+            "patente_semi":   patente_semi,
+            "conductor":      conductor,
+            "cert_sanitario": cert_sanitario,
+            "destinatario":   destinatario,
+            "texto_completo": texto,
+            "productos":      [],   # reservado para parser de tabla por pesquera
         }
-        for fam, vals in acumulado.items()
-    ]
 
-
-# ── Bloque de prueba ──────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    import os
-
-    BASE = os.path.join(os.path.dirname(__file__), "pdfs_prueba")
-    guias = [
-        "guia_agrosuper.pdf",
-        "guia_bb.pdf",
-    ]
-
-    for nombre in guias:
-        ruta = os.path.join(BASE, nombre)
-        print(f"\n{'─' * 60}")
-        print(f"  Guía : {nombre}")
-        print(f"{'─' * 60}")
-        datos = extraer_datos_guia(ruta)
-        for clave, valor in datos.items():
-            if clave == "productos":
-                print(f"  {'productos':<15}:")
-                for familia in valor:
-                    print(
-                        f"      {familia['familia']:<30}"
-                        f"  cajas: {familia['cajas_totales']:>4}   "
-                        f"kilos: {familia['kilos_totales']:>9.2f}"
-                    )
-            else:
-                print(f"  {clave:<15}: {valor}")
-    print()
+    except Exception as e:
+        print(f"[extractor_guias] Error: {e}")
+        return None

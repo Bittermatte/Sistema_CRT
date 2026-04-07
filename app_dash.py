@@ -94,5 +94,10 @@ app.index_string = app.index_string.replace(
 app.layout = serve_layout
 register_callbacks(app)
 
+# Registrar callbacks de todas las páginas al iniciar
+import src.dash_ui.pages.elaborar_crt  # noqa: F401
+import src.dash_ui.pages.buscar        # noqa: F401
+import src.dash_ui.pages.historial     # noqa: F401
+
 if __name__ == "__main__":
     app.run(debug=True, port=8051, host="0.0.0.0")

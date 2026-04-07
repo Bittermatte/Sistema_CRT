@@ -23,6 +23,7 @@ from modulos.extractor_guias import extraer_datos_guia
 from modulos.extractor_facturas import extraer_datos_factura
 from modulos.motor_calculos import calcular_fletes
 from modulos.generador_glosas import generar_textos_crt
+from modulos.config_cliente import CONFIG_ACTIVO
 
 # ---------------------------------------------------------------------------
 # Estilos locales reutilizables
@@ -75,16 +76,19 @@ def _detect_pais(direccion: str | None) -> str:
 # ---------------------------------------------------------------------------
 # Helpers — clasificación y extracción
 # ---------------------------------------------------------------------------
-def _classify_pdf(pdf_bytes: bytes) -> str:
+def _classify_pdf(pdf_bytes: bytes) -> str | None:
+    """Retorna 'guia', 'factura', o None si el PDF no es legible."""
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = "\n".join(p.extract_text() or "" for p in pdf.pages[:2])
+        if not text.strip():
+            return None
         if re.search(r"GUIA\s+DE\s+DESPACHO|GU[IÍ]A\s+ELECTR[OÓ]NICA", text, re.IGNORECASE):
             return "guia"
+        return "factura"
     except Exception:
-        pass
-    return "factura"
+        return None
 
 
 def _extract_pdf(pdf_bytes: bytes, tipo: str) -> dict:
@@ -146,16 +150,16 @@ def _build_form_data(crt: dict) -> dict:
 
     return {
         "f_numero_crt":           crt.get("correlativo", ""),
-        "f_remitente":            "EMPRESAS AQUACHILE S.A.",
+        "f_remitente":            CONFIG_ACTIVO["remitente"],
         "f_dir_remitente":        "CAMINO LOS PINOS S/N\nPUERTO MONTT - CHILE",
-        "f_transportista":        "TRANSPORTES VESPRINI E.I.R.L.",
+        "f_transportista":        CONFIG_ACTIVO["transportista"],
         "f_destinatario":         f.get("destinatario", ""),
         "f_dir_destinatario":     f.get("direccion", ""),
         "f_consignatario":        f.get("destinatario", ""),
         "f_dir_consignatario":    f.get("direccion", ""),
         "f_notificar":            f.get("destinatario", ""),
         "f_dir_notificar":        f.get("direccion", ""),
-        "f_lugar_emision":        "PUERTO NATALES - CHILE",
+        "f_lugar_emision":        CONFIG_ACTIVO["lugar_emision"],
         "f_lugar_recepcion":      "PUERTO NATALES - CHILE",
         "f_lugar_entrega":        tx.get("texto_casilla_8", ""),
         "f_destino_final":        tx.get("texto_casilla_8", ""),
@@ -183,7 +187,7 @@ def _build_form_data(crt: dict) -> dict:
     }
 
 
-def _recalculate_fletes(crts: dict, tarifa: float = 4400.0) -> dict:
+def _recalculate_fletes(crts: dict, tarifa: float = CONFIG_ACTIVO["tarifa_flete"]) -> dict:
     """
     Agrupa CRTs completos por patente_tracto y prorratea el flete entre todos
     los que comparten camión, usando la suma de pesos como denominador.
@@ -373,17 +377,19 @@ def _render_crt_detail(crt: dict) -> html.Div:
     children += [
         html.Hr(style={"borderColor": COLORS["border"], "margin": "12px 0"}),
         dbc.Button(
-            "⬇ Descargar este CRT",
+            "⬇ Descargar borrador" if crt["estado"] != "COMPLETO" else "⬇ Descargar CRT",
             id="btn-descargar-crt",
-            disabled=(crt["estado"] != "COMPLETO"),
+            disabled=not crt.get("form_data"),
             style={
                 "width":           "100%",
                 "borderRadius":    "8px",
                 "fontWeight":      "600",
                 "fontSize":        "13px",
                 "border":          "none",
-                "backgroundColor": COLORS["accent"]         if crt["estado"] == "COMPLETO" else COLORS["border"],
-                "color":           "#ffffff"                if crt["estado"] == "COMPLETO" else COLORS["text_secondary"],
+                "backgroundColor": COLORS["accent"]   if crt["estado"] == "COMPLETO"
+                                   else COLORS["warning"] if crt.get("form_data")
+                                   else COLORS["border"],
+                "color":           "#ffffff"           if crt.get("form_data") else COLORS["text_secondary"],
             },
         ),
     ]
@@ -458,7 +464,7 @@ def layout():
         # ── Zona A: Upload (ancho completo) ───────────────────────────────
         dcc.Upload(
             id="upload-docs",
-            accept=".pdf",
+            accept=".pdf,.xlsx,.xls",
             multiple=True,
             children=html.Div([
                 html.I(className="fas fa-cloud-upload-alt",
@@ -466,7 +472,7 @@ def layout():
                 html.P("Arrastra aquí las Guías de Despacho y Facturas",
                        style={"color": "#8898aa", "marginTop": "8px", "marginBottom": "2px",
                               "fontWeight": "600"}),
-                html.P("Se clasifican y emparejan automáticamente",
+                html.P("PDF o Excel (.xlsx) — se clasifican y emparejan automáticamente",
                        style={"fontSize": "12px", "color": "#adb5bd"}),
             ]),
             style={
@@ -591,91 +597,42 @@ def layout():
     prevent_initial_call=True,
 )
 def update_store(list_of_contents, _limpiar, list_of_names, store_data):
-    triggered = ctx.triggered_id
+    from src.services.orchestrator import procesar_documentos
 
-    if triggered == "btn-limpiar":
+    if ctx.triggered_id == "btn-limpiar":
         return {"crts": {}, "next_numero": 5098}, []
 
     if not list_of_contents:
         raise PreventUpdate
 
     store_data = store_data or {"crts": {}, "next_numero": 5098}
-    crts       = store_data.get("crts", {})
-    next_num   = store_data.get("next_numero", 5098)
-    errors     = []
 
+    archivos = []
     for content, nombre in zip(list_of_contents, list_of_names):
         try:
-            pdf_bytes = base64.b64decode(content.split(",")[1])
-            tipo      = _classify_pdf(pdf_bytes)
-            datos     = _extract_pdf(pdf_bytes, tipo)
+            _, data = content.split(",", 1)
+            archivos.append((nombre, base64.b64decode(data)))
+        except Exception:
+            continue
 
-            if tipo == "guia":
-                match_id = _find_matching_crt(crts, nombre, "guia")
-                if match_id:
-                    c = crts[match_id]
-                    c["guia_datos"]  = datos
-                    c["nombre_guia"] = nombre
-                    c["estado"]      = "COMPLETO"
-                    pais = _detect_pais((c.get("factura_datos") or {}).get("direccion"))
-                    tx   = generar_textos_crt(pais, next_num)
-                    c["correlativo"] = tx["correlativo_casilla_2"]
-                    c["textos"]      = tx
-                    next_num += 1
-                else:
-                    crt_id = str(uuid.uuid4())
-                    crts[crt_id] = {
-                        "id": crt_id, "correlativo": None,
-                        "destinatario": "—", "estado": "FALTA_FACTURA",
-                        "guia_datos": datos, "factura_datos": None,
-                        "fletes": None, "textos": None,
-                        "nombre_guia": nombre, "nombre_factura": None,
-                        "form_data": None,
-                    }
+    store_nuevo, errores = procesar_documentos(store_data, archivos)
 
-            else:  # factura
-                dest     = datos.get("destinatario", "—")
-                match_id = _find_matching_crt(crts, nombre, "factura")
-                if match_id:
-                    c = crts[match_id]
-                    c["factura_datos"]  = datos
-                    c["nombre_factura"] = nombre
-                    c["destinatario"]   = dest
-                    c["estado"]         = "COMPLETO"
-                    pais = _detect_pais(datos.get("direccion"))
-                    tx   = generar_textos_crt(pais, next_num)
-                    c["correlativo"] = tx["correlativo_casilla_2"]
-                    c["textos"]      = tx
-                    next_num += 1
-                else:
-                    crt_id = str(uuid.uuid4())
-                    crts[crt_id] = {
-                        "id": crt_id, "correlativo": None,
-                        "destinatario": dest, "estado": "FALTA_GUIA",
-                        "guia_datos": None, "factura_datos": datos,
-                        "fletes": None, "textos": None,
-                        "nombre_guia": None, "nombre_factura": nombre,
-                        "form_data": None,
-                    }
-
-        except Exception as e:
-            errors.append(f"{nombre}: {e}")
-
-    # Recalcular fletes — protegido para no interrumpir el flujo si falla
-    try:
-        crts = _recalculate_fletes(crts)
-    except Exception as e:
-        errors.append(f"Error al calcular fletes: {e}")
-
-    alerts = [
-        dbc.Alert(
-            [html.Strong("Error al procesar: "), str(e)],
-            color="danger", dismissable=True,
-            style={"fontSize": "13px"},
-        )
-        for e in errors
-    ]
-    return {"crts": crts, "next_numero": next_num}, alerts
+    alerts = []
+    for err in errores:
+        if err.startswith("DISCREPANCIA:"):
+            msg = err[len("DISCREPANCIA:"):]
+            alerts.append(dbc.Alert(
+                [html.Strong("⚠ Discrepancia: "), msg],
+                color="warning", dismissable=True,
+                style={"fontSize": "13px"},
+            ))
+        else:
+            alerts.append(dbc.Alert(
+                [html.Strong("Aviso: "), err],
+                color="danger", dismissable=True,
+                style={"fontSize": "13px"},
+            ))
+    return store_nuevo, alerts
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +675,7 @@ def seleccionar_crt(n_clicks_list, store_data):
     detail  = _render_crt_detail(crt)
     preview = _render_empty_preview()
 
-    if crt["estado"] == "COMPLETO" and crt.get("form_data"):
+    if crt.get("form_data"):
         try:
             pdf_bytes = generate_crt_pdf(crt["form_data"])
             if pdf_bytes:
@@ -749,13 +706,14 @@ def descargar_crt(n_clicks, selected_id, store_data):
         raise PreventUpdate
     crts = (store_data or {}).get("crts", {})
     crt  = crts.get(selected_id)
-    if not crt or crt["estado"] != "COMPLETO" or not crt.get("form_data"):
+    if not crt or not crt.get("form_data"):
         raise PreventUpdate
     pdf_bytes = generate_crt_pdf(crt["form_data"])
     if not pdf_bytes:
         raise PreventUpdate
-    correlativo = (crt.get("correlativo") or "crt").replace("/", "-")
-    return dcc.send_bytes(pdf_bytes, f"CRT_{correlativo}.pdf")
+    correlativo = (crt.get("correlativo") or "borrador").replace("/", "-")
+    sufijo = "" if crt["estado"] == "COMPLETO" else "_borrador"
+    return dcc.send_bytes(pdf_bytes, f"CRT_{correlativo}{sufijo}.pdf")
 
 
 # ---------------------------------------------------------------------------

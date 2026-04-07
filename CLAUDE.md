@@ -69,6 +69,7 @@ Usuario sube PDF/Excel
 | `modulos/extractor_guias.py` | ✅ activo | Extrae datos de guías de despacho PDF |
 | `modulos/extractor_facturas.py` | ✅ activo | Extrae datos de facturas PDF y Excel (.xlsx) |
 | `modulos/motor_calculos.py` | ✅ activo | Prorrateo de fletes |
+| `modulos/motor_agrupacion.py` | ✅ activo | Reglas de agrupación de documentos en CRTs por pesquera/destinatario |
 | `modulos/generador_glosas.py` | ✅ activo | Genera textos casillas 8 y 18 del CRT |
 
 ### Legacy / referencia
@@ -160,11 +161,41 @@ Discrepancias se prefijan con `"DISCREPANCIA:"` para que el callback las coloree
 
 ---
 
+## Módulo `modulos/motor_agrupacion.py`
+
+Lógica de negocio sobre cómo agrupar documentos en CRTs según pesquera y destinatario.
+
+Tipos: `Documento` (guía o factura individual) y `GrupoCRT` (conjunto de docs que forman un CRT).
+
+`CLIENTES_AGRUPAN` — destinatarios que consolidan múltiples GDs en un solo CRT por pesquera:
+- AquaChile: `AQUACHILE INC`
+- Blumar/Blumar Magallanes: `BLUGLACIER`
+- Multi X: `MULTI X INC`
+- Australis: `TRAPANANDA SEAFARMS`, `COSTCO`, `PESCADERIA ATLANTICA`
+- Cermaq: `CERMAQ US LLC`
+
+`CLIENTES_NUNCA_AGRUPAN`: AquaChile + `AGROSUPER` → siempre 1 GD = 1 CRT.
+
+Funciones clave:
+- `agrupar_documentos(documentos, patente_tracto)` — punto de entrada
+- `_cliente_agrupa(pesquera, destinatario)` — regla de negocio por pesquera
+- `_es_factura_lb(factura_datos)` — detecta facturas en libras (Australis las ignora)
+- `consolidar_productos_australis(grupos)` — suma cajas de líneas de producto idénticas
+
+**Pendiente:** integrar en `orchestrator.py` — el orquestador debe llamar a
+`agrupar_documentos()` antes de crear los CRTs en el store.
+
+---
+
 ## Pendientes en orden de prioridad
 
 ### P1 — Crítico (bloquea operación)
 
-1. **Validar patrones con documentos reales de cada pesquera**
+1. **Integrar `motor_agrupacion` en `orchestrator.py`**
+   - `procesar_documentos()` debe llamar a `agrupar_documentos()` antes de crear CRTs
+   - Hoy el orquestador procesa documento a documento; con el motor procesa lotes completos
+
+2. **Validar patrones con documentos reales de cada pesquera**
    - Probar `orden_venta` y `ref_pedido` con guías y facturas reales de Multi X, Cermaq, Blumar
    - Los patrones fueron definidos a partir de descripción verbal — pueden necesitar ajuste
    - Herramienta de diagnóstico: `python3 -c "from modulos.extractor_guias import extraer_datos_guia; import pprint; pprint.pprint(extraer_datos_guia('ruta/guia.pdf'))"`

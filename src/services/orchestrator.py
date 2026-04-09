@@ -24,32 +24,14 @@ from modulos.extractor_guias    import extraer_datos_guia
 from modulos.extractor_facturas import extraer_datos_factura
 from modulos.motor_calculos     import calcular_fletes
 from modulos.generador_glosas   import generar_textos_crt
-from modulos.config_cliente     import CONFIG_ACTIVO, get_config_desde_texto
+from modulos.config_cliente     import CONFIG_ACTIVO, get_config_desde_texto, get_config
+from modulos.motor_agrupacion   import Documento, agrupar_documentos, consolidar_productos_australis
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 MATCH_THRESHOLD      = 0.50
 ESTADO_COMPLETO      = "COMPLETO"
 ESTADO_FALTA_FACTURA = "FALTA_FACTURA"
 ESTADO_FALTA_GUIA    = "FALTA_GUIA"
-
-# ── Detección automática de pesquera ─────────────────────────────────────────
-PESQUERAS = {
-    "AQUACHILE":  ["EMPRESAS AQUACHILE", "AQUACHILE S.A"],
-    "BLUMAR":     ["SALMONES BLUMAR MAGALLANES", "SALMONES BLUMAR S.A"],
-    "MULTIX":     ["MULTI X S.A", "MULTI X SALMON"],
-    "AUSTRALIS":  ["AUSTRALIS MAR S.A"],
-    "CERMAQ":     ["CERMAQ CHILE S.A"],
-}
-
-
-def detectar_pesquera(texto: str) -> str:
-    """Detecta la pesquera remitente según el texto del PDF."""
-    texto_upper = texto.upper()
-    for pesquera, keywords in PESQUERAS.items():
-        if any(kw in texto_upper for kw in keywords):
-            return pesquera
-    return "DESCONOCIDA"
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _extraer_texto_raw(pdf_bytes: bytes) -> str:
@@ -337,81 +319,221 @@ def recalcular_fletes(crts: dict) -> dict:
                 continue
             for crt_id in ids:
                 pb = float(crts[crt_id].get("guia_datos", {}).get("peso_bruto") or 0)
-                tarifa = (crts[crt_id].get("config") or CONFIG_ACTIVO).get("tarifa_flete", 4400)
+
+                # Tarifa especial para MARDI y AGRO COMERCIAL DEL CARMEN: 4.250 USD fijos
+                dest = (crts[crt_id].get("factura_datos", {}) or {}).get("destinatario", "")
+                dest_up = dest.upper() if dest else ""
+                if "MARDI" in dest_up or "AGRO COMERCIAL DEL CARMEN" in dest_up:
+                    tarifa = 4250
+                else:
+                    tarifa = (crts[crt_id].get("config") or CONFIG_ACTIVO).get("tarifa_flete", 4400)
+
                 fletes = calcular_fletes(pb, peso_total, tarifa)
                 crts[crt_id]["fletes"] = fletes
                 if crts[crt_id].get("form_data"):
                     fd = crts[crt_id]["form_data"]
-                    fd["f_flete_origen"]   = f"{fletes.get('flete_origen_frontera', 0):.2f}"
-                    fd["f_flete_frontera"] = f"{fletes.get('flete_frontera_destino', 0):.2f}"
-                    fd["f_flete_usd"]      = f"{fletes.get('flete_prorrateado', 0):.2f}"
+                    # Usar _fmt_es (formato español) para consistencia con construir_form_data
+                    # Importante: excel_pdf_builder convierte esperando punto=miles, coma=decimal
+                    fd["f_flete_origen"]   = _fmt_es(fletes.get("flete_origen_frontera", 0))
+                    fd["f_flete_frontera"] = _fmt_es(fletes.get("flete_frontera_destino", 0))
+                    fd["f_flete_usd"]      = _fmt_es(fletes.get("flete_prorrateado", 0))
     except Exception as e:
         print(f"[orchestrator] Error recalculando fletes: {e}")
     return crts
 
 
 # ── Builder de form_data ──────────────────────────────────────────────────────
+
+def _fmt_es(v) -> str:
+    """Formatea número en formato español: 1.234,56 (punto miles, coma decimal).
+    Retorna '' para None o 0 (no mostrar ceros en el PDF)."""
+    if v is None:
+        return ""
+    try:
+        f_val = float(str(v).replace(",", "."))
+        if f_val == 0.0:
+            return ""
+        return (
+            f"{f_val:,.2f}"
+            .replace(",", "X").replace(".", ",").replace("X", ".")
+        )
+    except Exception:
+        return str(v) if v else ""
+
+
+def _construir_lineas_casilla11(pesquera: str, guia: dict, factura: dict) -> list[tuple[str, str]]:
+    """
+    Construye las líneas de producto para la casilla 11 del CRT.
+
+    Retorna lista de tuplas (descripcion, kilos_netos_formateado).
+    El numero de tuplas es variable (1 a 5).
+
+    Reglas por pesquera:
+      aquachile      — 1 línea por tipo de producto, "CON: X KG NETOS" en campo kilos
+      blumar /
+      blumar_magallanes — 1 línea consolidada, talla eliminada, sin kilos aparte
+      australis      — productos de la factura en inglés, inline "CON: X KG NETOS"
+      cermaq         — 1 línea consolidada de todo
+      multix         — 1 línea por categoría, "CON: X NETOS" / "CON: X KG NETOS"
+    """
+    productos_guia    = guia.get("productos") or []
+    productos_factura = factura.get("productos") or []
+
+    # ── AUSTRALIS: productos vienen de la factura en inglés ───────────────────
+    if pesquera == "australis":
+        lineas = []
+        for p in productos_factura[:5]:
+            desc  = p.get("descripcion") or p.get("familia") or ""
+            cajas = p.get("cajas_totales", 0)
+            kg    = p.get("kilos_totales", 0.0)
+            if desc and cajas:
+                lineas.append((
+                    f"{cajas} CAJAS CON {desc}, CON: {_fmt_es(kg)} KG NETOS",
+                    "",  # kilos inline en la descripción
+                ))
+        return lineas or [("", "")]
+
+    # ── BLUMAR / BLUMAR MAGALLANES: 1 línea consolidada, sin talla ────────────
+    if pesquera in ("blumar", "blumar_magallanes"):
+        if not productos_guia:
+            return [("", "")]
+        total_cajas = sum(p.get("cajas_totales", 0) for p in productos_guia)
+        # Extraer tipo de corte de la primera línea (FILETE, ENTERO, etc.)
+        primera_desc = (productos_guia[0].get("descripcion") or "").upper()
+        # Limpiar: conservar solo "SALMON ATLANTICO [TIPO] ENFRIADO REFRIGERADO"
+        corte_m = re.search(
+            r'(?:SALMON\s+ATLANTICO\s+)?(\w[\w\s/]*?)\s+ENFRIADO\s+REFRIGERADO',
+            primera_desc, re.IGNORECASE
+        )
+        corte = corte_m.group(1).strip() if corte_m else "FILETE"
+        # Quitar palabras de especie que pudieran haber quedado
+        corte = re.sub(r'\b(?:SALMON|ATLANTICO|CRUDO)\b', '', corte, flags=re.IGNORECASE)
+        corte = re.sub(r'\s+', ' ', corte).strip()
+        desc = f"{total_cajas} CAJAS CON SALMON ATLANTICO {corte} ENFRIADO REFRIGERADO."
+        return [(desc, "")]
+
+    # ── CERMAQ: 1 línea consolidada ───────────────────────────────────────────
+    if pesquera == "cermaq":
+        if not productos_guia:
+            return [("", "")]
+        total_cajas = sum(p.get("cajas_totales", 0) for p in productos_guia)
+        # La descripción ya viene limpiada por _limpiar_desc_cermaq en extractor_guias
+        # Usar la primera (normalmente todas son lo mismo consolidado)
+        primera_desc = (productos_guia[0].get("descripcion") or "").upper().strip()
+        # Si no tiene "SALMON DEL ATLANTICO" como prefijo, añadirlo
+        if not primera_desc.startswith("SALMON DEL ATLANTICO"):
+            primera_desc = "SALMON DEL ATLANTICO " + primera_desc
+        desc = f"{total_cajas} CAJAS CON {primera_desc}"
+        return [(desc, "")]
+
+    # ── MULTI X: 1 línea por categoría, kilos inline ─────────────────────────
+    if pesquera == "multix":
+        if not productos_guia:
+            return [("", "")]
+        lineas = []
+        for p in productos_guia[:5]:
+            desc_raw = (p.get("familia") or p.get("descripcion") or "").upper()
+            cajas    = p.get("cajas_totales", 0)
+            kg       = p.get("kilos_totales", 0.0)
+            if not desc_raw or not cajas:
+                continue
+            # Quitar prefijo redundante si extractor lo dejó completo
+            desc_raw = re.sub(
+                r'^(?:SALMON\s+DEL\s+ATLANTICO\s+CRUDO\s+)?(?:Enfriado\s+Refrigerado\s+)?',
+                '', desc_raw, flags=re.IGNORECASE
+            ).strip()
+            # Determinar sufijo de kilos: primera línea "NETOS", resto "KG NETOS" / "KILOS NETOS"
+            sufijo_kg = "NETOS" if not lineas else "KG NETOS"
+            lineas.append((
+                f"{cajas} CAJAS CON SALMON ATLANTICO {desc_raw}, CON: {_fmt_es(kg)} {sufijo_kg}",
+                "",
+            ))
+        return lineas or [("", "")]
+
+    # ── AQUACHILE (default): 1 línea por producto, kilos en campo separado ────
+    if not productos_guia:
+        return [("", "")]
+    lineas = []
+    for p in productos_guia[:5]:
+        familia = (p.get("familia") or p.get("descripcion") or "").strip()
+        cajas   = p.get("cajas_totales", 0)
+        kg      = p.get("kilos_totales", 0.0)
+        if not familia or not cajas:
+            continue
+        lineas.append((
+            f"{cajas} CAJAS CON SALMON DEL ATLANTICO CRUDO {familia}",
+            f"CON: {_fmt_es(kg)} KG NETOS",
+        ))
+    return lineas or [("", "")]
+
+
 def construir_form_data(crt: dict) -> dict:
-    """Construye el dict f_* para el generador de PDF."""
+    """
+    Construye el dict f_* para el generador de PDF.
+
+    Casilla 11: lógica por pesquera (ver _construir_lineas_casilla11)
+    Casilla 9 (notificar): según config["notificar"] → destinatario o Alpha Brokers
+    """
+    from modulos.config_cliente import ALPHA_BROKERS
+
     guia    = crt.get("guia_datos")    or {}
     factura = crt.get("factura_datos") or {}
     fletes  = crt.get("fletes")        or {}
     textos  = crt.get("textos")        or {}
     config  = crt.get("config") or CONFIG_ACTIVO
+    pesquera = crt.get("pesquera") or config.get("clave", "aquachile")
 
-    def fmt(v):
-        if v is None:
-            return ""
-        try:
-            return (
-                f"{float(str(v).replace(',', '.')):,.2f}"
-                .replace(",", "X").replace(".", ",").replace("X", ".")
-            )
-        except Exception:
-            return str(v)
+    # ── Casilla 9: notificar ──────────────────────────────────────────────────
+    notificar_regla = config.get("notificar", "destinatario")
+    if notificar_regla == "alpha_brokers":
+        f_notificar     = ALPHA_BROKERS["nombre"]
+        f_dir_notificar = f"{ALPHA_BROKERS['direccion']}\n{ALPHA_BROKERS['telefono']}"
+    else:
+        f_notificar     = factura.get("destinatario", "")
+        f_dir_notificar = factura.get("direccion", "")
 
-    productos = guia.get("productos") or []
-    desc1 = kn1 = desc2 = kn2 = ""
-    if len(productos) > 0:
-        p     = productos[0]
-        desc1 = (f"{p.get('cajas_totales', '')} CAJAS CON SALMON DEL ATLANTICO "
-                 f"CRUDO Enfriado Refrigerado {p.get('familia', '')}")
-        kn1   = fmt(p.get("kilos_totales"))
-    if len(productos) > 1:
-        p     = productos[1]
-        desc2 = (f"{p.get('cajas_totales', '')} CAJAS CON SALMON DEL ATLANTICO "
-                 f"CRUDO Enfriado Refrigerado {p.get('familia', '')}")
-        kn2   = fmt(p.get("kilos_totales"))
+    # ── Casilla 11: descripción de mercadería ─────────────────────────────────
+    lineas = _construir_lineas_casilla11(pesquera, guia, factura)
+
+    # Poblar f_descripcion_1..5 y f_kilos_netos_1..5
+    desc_fields = {}
+    for i in range(1, 6):
+        idx = i - 1
+        if idx < len(lineas):
+            desc_fields[f"f_descripcion_{i}"] = lineas[idx][0]
+            desc_fields[f"f_kilos_netos_{i}"] = lineas[idx][1]
+        else:
+            desc_fields[f"f_descripcion_{i}"] = ""
+            desc_fields[f"f_kilos_netos_{i}"] = ""
 
     return {
         "f_remitente":            config.get("remitente", ""),
         "f_dir_remitente":        config.get("dir_remitente", ""),
         "f_transportista":        config.get("transportista", "TRANSPORTES VESPRINI S.A"),
+        "f_dir_transportista":    config.get("dir_transportista", "Avda Colon 1761 Bahia Blanca BS - AS\nARGENTINA"),
+        "f_firma_remitente":      config.get("firma_remitente", ""),
         "f_lugar_emision":        config.get("lugar_emision", "PUERTO NATALES - CHILE"),
         "f_numero_crt":           textos.get("correlativo_casilla_2", ""),
         "f_destinatario":         factura.get("destinatario", ""),
         "f_dir_destinatario":     factura.get("direccion", ""),
         "f_consignatario":        factura.get("destinatario", ""),
         "f_dir_consignatario":    factura.get("direccion", ""),
-        "f_notificar":            factura.get("destinatario", ""),
-        "f_dir_notificar":        factura.get("direccion", ""),
+        "f_notificar":            f_notificar,
+        "f_dir_notificar":        f_dir_notificar,
         "f_lugar_recepcion":      config.get("lugar_emision", "") + ".",
-        "f_fecha_documento":      guia.get("fecha", ""),
-        "f_fecha_emision":        guia.get("fecha", ""),
+        "f_fecha_documento":      factura.get("fecha") or guia.get("fecha", ""),
+        "f_fecha_emision":        factura.get("fecha") or guia.get("fecha", ""),
         "f_lugar_entrega":        textos.get("texto_casilla_8", ""),
         "f_destino_final":        f"ARGENTINA - DESTINO FINAL {factura.get('pais_destino', 'USA')}",
-        "f_descripcion_1":        desc1,
-        "f_kilos_netos_1":        kn1,
-        "f_descripcion_2":        desc2,
-        "f_kilos_netos_2":        kn2,
-        "f_peso_bruto":           fmt(guia.get("peso_bruto")),
-        "f_peso_neto":            fmt(guia.get("peso_neto")),
-        "f_total_cajas":          str(guia.get("bultos", "")),
+        **desc_fields,
+        "f_peso_bruto":           _fmt_es(guia.get("peso_bruto")),
+        "f_peso_neto":            _fmt_es(guia.get("peso_neto")),
+        "f_total_cajas":          str(guia.get("bultos") or ""),
         "f_valor_mercaderia":     factura.get("total", ""),
         "f_incoterm":             factura.get("incoterm", ""),
-        "f_flete_origen":         fmt(fletes.get("flete_origen_frontera")),
-        "f_flete_frontera":       fmt(fletes.get("flete_frontera_destino")),
-        "f_flete_usd":            fmt(fletes.get("flete_prorrateado")),
+        "f_flete_origen":         _fmt_es(fletes.get("flete_origen_frontera")),
+        "f_flete_frontera":       _fmt_es(fletes.get("flete_frontera_destino")),
+        "f_flete_usd":            _fmt_es(fletes.get("flete_prorrateado")),
         "f_num_factura":          str(factura.get("numero_factura", "")),
         "f_guias_despacho":       str(guia.get("numero_guia", "")),
         "f_cert_sanitario":       str(factura.get("cert_sanitario") or guia.get("cert_sanitario", "")),
@@ -420,6 +542,69 @@ def construir_form_data(crt: dict) -> dict:
         "f_patente_camion":       guia.get("patente_tracto", ""),
         "f_patente_rampla":       guia.get("patente_semi", ""),
     }
+
+
+# ── Helpers de merge para grupos con múltiples documentos ────────────────────
+
+def _merge_guias(guias) -> dict:
+    """Fusiona datos de múltiples Documento(tipo=guia) en un único dict."""
+    if not guias:
+        return {}
+    if len(guias) == 1:
+        return dict(guias[0].datos)
+
+    base = dict(guias[0].datos)
+
+    # Concatenar números de guía
+    nums = [g.datos.get("numero_guia") or "" for g in guias]
+    base["numero_guia"] = ", ".join(n for n in nums if n) or None
+
+    # Sumar pesos y bultos
+    for campo in ("peso_bruto", "peso_neto"):
+        total = sum(float(g.datos.get(campo) or 0) for g in guias)
+        base[campo] = total if total > 0 else None
+    bultos = sum(int(g.datos.get("bultos") or 0) for g in guias)
+    base["bultos"] = bultos if bultos > 0 else None
+
+    # Productos concatenados
+    prods = []
+    for g in guias:
+        prods.extend(g.datos.get("productos") or [])
+    base["productos"] = prods
+
+    return base
+
+
+def _merge_facturas(facturas) -> dict:
+    """Fusiona datos de múltiples Documento(tipo=factura) en un único dict."""
+    if not facturas:
+        return {}
+    if len(facturas) == 1:
+        return dict(facturas[0].datos)
+
+    base = dict(facturas[0].datos)
+
+    # Concatenar números de factura
+    nums = [str(f.datos.get("numero_factura") or "") for f in facturas]
+    base["numero_factura"] = ", ".join(n for n in nums if n) or None
+
+    # Sumar totales monetarios si son numéricos
+    try:
+        total = sum(
+            float(str(f.datos.get("total") or 0).replace(",", ""))
+            for f in facturas
+        )
+        base["total"] = f"{total:.2f}" if total > 0 else base.get("total")
+    except (TypeError, ValueError):
+        pass
+
+    # Concatenar productos (necesario para Australis multi-factura)
+    prods = []
+    for f in facturas:
+        prods.extend(f.datos.get("productos") or [])
+    base["productos"] = prods
+
+    return base
 
 
 # ── Función principal ─────────────────────────────────────────────────────────
@@ -431,9 +616,15 @@ def procesar_documentos(
     Punto de entrada único. Recibe documentos de cualquier fuente
     (frontend manual o Gmail automático) y actualiza el store.
 
+    Flujo:
+      FASE 1 — Clasificar y extraer todos los documentos del lote → list[Documento]
+      FASE 2 — agrupar_documentos() → list[GrupoCRT]  (motor_agrupacion)
+      FASE 3 — Convertir cada GrupoCRT a una entrada del store;
+               para grupos incompletos se intenta matching con el store existente.
+
     Parámetros:
         store_actual: {"crts": {...}, "next_numero": int}
-        archivos:     [(nombre_archivo, pdf_bytes), ...]
+        archivos:     [(nombre_archivo, file_bytes), ...]
 
     Retorna:
         (store_actualizado, lista_errores)
@@ -442,44 +633,115 @@ def procesar_documentos(
     next_num = store_actual.get("next_numero", 5000)
     errores  = []
 
-    for nombre, pdf_bytes in archivos:
+    # ── FASE 1: Clasificar y extraer ─────────────────────────────────────────
+    nuevos_docs: list = []       # list[Documento]
+    nombres_doc: dict = {}       # id(Documento) → nombre_archivo
+
+    for nombre, file_bytes in archivos:
         try:
-            # 1. Clasificar por tipo de archivo y contenido
-            tipo = clasificar_documento(pdf_bytes, nombre)
+            tipo = clasificar_documento(file_bytes, nombre)
             if tipo is None:
                 errores.append(
                     f"No se pudo clasificar '{nombre}' — no parece ser guía ni factura."
                 )
                 continue
 
-            # 2. Extraer datos (PDF o Excel)
-            datos = extraer_documento(pdf_bytes, tipo, nombre)
+            datos = extraer_documento(file_bytes, tipo, nombre)
             if datos is None:
                 errores.append(f"Error extrayendo datos de '{nombre}'.")
                 continue
 
-            # 3. Detectar pesquera y cargar config desde el texto del PDF
-            texto_raw          = _extraer_texto_raw(pdf_bytes)
-            clave_pesquera, config_pesquera = get_config_desde_texto(texto_raw)
+            # Enriquecer pesquera desde texto bruto si extractor no la detectó
+            texto_raw = _extraer_texto_raw(file_bytes)
+            clave_raw, _ = get_config_desde_texto(texto_raw)
+            if not datos.get("pesquera") or datos["pesquera"] == "DESCONOCIDA":
+                datos["pesquera"] = clave_raw
 
-            # 4. Matching y actualización del store
-            if tipo == "guia":
-                match_id = buscar_match_factura(datos, crts)
+            doc = Documento(
+                tipo=tipo,
+                pesquera=datos.get("pesquera") or clave_raw or "DESCONOCIDA",
+                numero=str(datos.get("numero_guia") or datos.get("numero_factura") or ""),
+                destinatario=(datos.get("destinatario") or ""),
+                datos=datos,
+                pdf_bytes=file_bytes,
+            )
+            nuevos_docs.append(doc)
+            nombres_doc[id(doc)] = nombre
+
+        except Exception as e:
+            errores.append(f"Error procesando '{nombre}': {e}")
+
+    if not nuevos_docs:
+        return {"crts": crts, "next_numero": next_num}, errores
+
+    # ── FASE 2: Agrupar con motor_agrupacion ─────────────────────────────────
+    grupos = agrupar_documentos(nuevos_docs)
+    # Consolidar productos idénticos de Australis antes de convertir a store
+    grupos = consolidar_productos_australis(grupos)
+
+    # ── FASE 3: Convertir grupos a entradas del store ────────────────────────
+    for grupo in grupos:
+        try:
+            guia_datos    = _merge_guias(grupo.guias)      if grupo.guias    else None
+            factura_datos = _merge_facturas(grupo.facturas) if grupo.facturas else None
+
+            nombre_guia    = nombres_doc.get(id(grupo.guias[0]))    if grupo.guias    else None
+            nombre_factura = nombres_doc.get(id(grupo.facturas[0])) if grupo.facturas else None
+
+            clave_pesquera  = grupo.pesquera
+            config_pesquera = get_config(clave_pesquera) or CONFIG_ACTIVO
+
+            if grupo.completo:
+                # ── Grupo con guías Y facturas → CRT completo directo ────────
+                crt_id = str(uuid.uuid4())
+                pais = factura_datos.get("pais_destino", "USA")
+                tx   = generar_textos_crt(
+                    pais_destino=pais,
+                    numero_base=next_num,
+                    paso_frontera=config_pesquera.get("paso_frontera", "MONTE AYMOND"),
+                    aeropuerto=config_pesquera.get("aeropuerto", "MINISTRO PISTARINI"),
+                )
+                crts[crt_id] = {
+                    "id":             crt_id,
+                    "estado":         ESTADO_COMPLETO,
+                    "guia_datos":     guia_datos,
+                    "factura_datos":  factura_datos,
+                    "fletes":         None,
+                    "textos":         tx,
+                    "form_data":      None,
+                    "correlativo":    tx.get("correlativo_casilla_2"),
+                    "destinatario":   (factura_datos.get("destinatario")
+                                       or guia_datos.get("destinatario") or "—"),
+                    "pesquera":       clave_pesquera,
+                    "config":         config_pesquera,
+                    "nombre_guia":    nombre_guia,
+                    "nombre_factura": nombre_factura,
+                }
+                crts[crt_id]["form_data"] = construir_form_data(crts[crt_id])
+                avisos = detectar_discrepancias(guia_datos, factura_datos)
+                errores.extend(f"DISCREPANCIA:{a}" for a in avisos)
+                next_num += 1
+
+            elif grupo.guias and not grupo.facturas:
+                # ── Solo guías — buscar factura huérfana en el store ─────────
+                match_id = buscar_match_factura(guia_datos, crts)
                 if match_id:
-                    crts[match_id]["guia_datos"]  = datos
-                    crts[match_id]["guia_nombre"]  = nombre
-                    crts[match_id]["nombre_guia"]  = nombre
-                    crts[match_id]["estado"]        = ESTADO_COMPLETO
-                    # Preferir la config detectada en la guía (tiene el remitente)
-                    crts[match_id]["pesquera"]      = clave_pesquera
-                    crts[match_id]["config"]        = config_pesquera
+                    crts[match_id]["guia_datos"]    = guia_datos
+                    crts[match_id]["nombre_guia"]   = nombre_guia
+                    crts[match_id]["estado"]         = ESTADO_COMPLETO
+                    crts[match_id]["pesquera"]       = clave_pesquera
+                    crts[match_id]["config"]         = config_pesquera
                     pais = crts[match_id]["factura_datos"].get("pais_destino", "USA")
-                    tx   = generar_textos_crt(pais_destino=pais, numero_base=next_num)
-                    crts[match_id]["textos"]        = tx
-                    crts[match_id]["correlativo"]   = tx.get("correlativo_casilla_2")
-                    crts[match_id]["form_data"]     = construir_form_data(crts[match_id])
-                    # Advertencias de discrepancia logística
-                    avisos = detectar_discrepancias(datos, crts[match_id]["factura_datos"])
+                    tx   = generar_textos_crt(
+                        pais_destino=pais,
+                        numero_base=next_num,
+                        paso_frontera=config_pesquera.get("paso_frontera", "MONTE AYMOND"),
+                        aeropuerto=config_pesquera.get("aeropuerto", "MINISTRO PISTARINI"),
+                    )
+                    crts[match_id]["textos"]         = tx
+                    crts[match_id]["correlativo"]    = tx.get("correlativo_casilla_2")
+                    crts[match_id]["form_data"]      = construir_form_data(crts[match_id])
+                    avisos = detectar_discrepancias(guia_datos, crts[match_id]["factura_datos"])
                     errores.extend(f"DISCREPANCIA:{a}" for a in avisos)
                     next_num += 1
                 else:
@@ -487,40 +749,42 @@ def procesar_documentos(
                     crts[crt_id] = {
                         "id":             crt_id,
                         "estado":         ESTADO_FALTA_FACTURA,
-                        "guia_datos":     datos,
-                        "guia_nombre":    nombre,
+                        "guia_datos":     guia_datos,
                         "factura_datos":  None,
                         "fletes":         None,
                         "textos":         None,
                         "form_data":      None,
                         "correlativo":    None,
-                        "destinatario":   datos.get("destinatario") or datos.get("cliente") or "—",
+                        "destinatario":   guia_datos.get("destinatario") or "—",
                         "pesquera":       clave_pesquera,
                         "config":         config_pesquera,
-                        "nombre_guia":    nombre,
+                        "nombre_guia":    nombre_guia,
                         "nombre_factura": None,
                     }
                     crts[crt_id]["form_data"] = construir_form_data(crts[crt_id])
 
-            elif tipo == "factura":
-                match_id = buscar_match_guia(datos, crts)
+            elif grupo.facturas and not grupo.guias:
+                # ── Solo facturas — buscar guía huérfana en el store ─────────
+                match_id = buscar_match_guia(factura_datos, crts)
                 if match_id:
-                    crts[match_id]["factura_datos"]   = datos
-                    crts[match_id]["factura_nombre"]  = nombre
-                    crts[match_id]["nombre_factura"]  = nombre
-                    crts[match_id]["destinatario"]    = datos.get("destinatario", "—")
+                    crts[match_id]["factura_datos"]   = factura_datos
+                    crts[match_id]["nombre_factura"]  = nombre_factura
+                    crts[match_id]["destinatario"]    = factura_datos.get("destinatario", "—")
                     crts[match_id]["estado"]           = ESTADO_COMPLETO
-                    # Mantener la config de la guía si ya se cargó; si no, usar la de la factura
                     if not crts[match_id].get("config"):
                         crts[match_id]["pesquera"] = clave_pesquera
                         crts[match_id]["config"]   = config_pesquera
-                    pais = datos.get("pais_destino", "USA")
-                    tx   = generar_textos_crt(pais_destino=pais, numero_base=next_num)
+                    pais = factura_datos.get("pais_destino", "USA")
+                    tx   = generar_textos_crt(
+                        pais_destino=pais,
+                        numero_base=next_num,
+                        paso_frontera=config_pesquera.get("paso_frontera", "MONTE AYMOND"),
+                        aeropuerto=config_pesquera.get("aeropuerto", "MINISTRO PISTARINI"),
+                    )
                     crts[match_id]["textos"]           = tx
                     crts[match_id]["correlativo"]      = tx.get("correlativo_casilla_2")
                     crts[match_id]["form_data"]        = construir_form_data(crts[match_id])
-                    # Advertencias de discrepancia logística
-                    avisos = detectar_discrepancias(crts[match_id]["guia_datos"], datos)
+                    avisos = detectar_discrepancias(crts[match_id]["guia_datos"], factura_datos)
                     errores.extend(f"DISCREPANCIA:{a}" for a in avisos)
                     next_num += 1
                 else:
@@ -528,26 +792,24 @@ def procesar_documentos(
                     crts[crt_id] = {
                         "id":             crt_id,
                         "estado":         ESTADO_FALTA_GUIA,
-                        "factura_datos":  datos,
-                        "factura_nombre": nombre,
+                        "factura_datos":  factura_datos,
                         "guia_datos":     None,
                         "fletes":         None,
                         "textos":         None,
                         "form_data":      None,
                         "correlativo":    None,
-                        "destinatario":   datos.get("destinatario", "—"),
+                        "destinatario":   factura_datos.get("destinatario", "—"),
                         "pesquera":       clave_pesquera,
                         "config":         config_pesquera,
                         "nombre_guia":    None,
-                        "nombre_factura": nombre,
+                        "nombre_factura": nombre_factura,
                     }
                     crts[crt_id]["form_data"] = construir_form_data(crts[crt_id])
 
         except Exception as e:
-            errores.append(f"Error procesando '{nombre}': {e}")
-            continue
+            errores.append(f"Error procesando grupo ({grupo.pesquera}): {e}")
 
-    # 5. Recalcular fletes para todos los CRTs completos
+    # ── Recalcular fletes para todos los CRTs completos ──────────────────────
     crts = recalcular_fletes(crts)
 
     return {"crts": crts, "next_numero": next_num}, errores

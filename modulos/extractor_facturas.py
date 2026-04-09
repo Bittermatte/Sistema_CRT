@@ -92,6 +92,17 @@ PATRONES_REF_PEDIDO_PESQUERA = {
 
 INCOTERMS_VALIDOS = {"CPT", "CFR", "CIF", "FOB", "FCA", "DAP", "EXW", "DDP"}
 
+# Fecha de emisión del documento
+PATRONES_FECHA = [
+    r"FECHA\s+(?:DE\s+)?(?:EMISION|EMISI[OÓ]N|DOCUMENTO|FACTURA)\s*[.:/]\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+    r"DATE\s*[.:/]\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+    r"INVOICE\s+DATE\s*[.:/]\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+    r"(\d{1,2}\s+(?:DE\s+)?(?:ENERO|FEBRERO|MARZO|ABRIL|MAYO|JUNIO|JULIO|AGOSTO|SEPTIEMBRE|OCTUBRE|NOVIEMBRE|DICIEMBRE)\s+(?:DE\s+)?\d{4})",
+    r"(\d{1,2}\s+(?:JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)\s+\d{4})",
+    # dd-mm-yyyy o dd/mm/yyyy genérico — último recurso
+    r"(\d{2}[/-]\d{2}[/-]\d{4})",
+]
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -122,6 +133,51 @@ def _extraer_float(texto: str) -> Optional[float]:
         return None
 
 
+_MESES_ES = {
+    "ENERO": "01", "FEBRERO": "02", "MARZO": "03", "ABRIL": "04",
+    "MAYO": "05", "JUNIO": "06", "JULIO": "07", "AGOSTO": "08",
+    "SEPTIEMBRE": "09", "OCTUBRE": "10", "NOVIEMBRE": "11", "DICIEMBRE": "12",
+}
+_MESES_EN = {
+    "JANUARY": "01", "FEBRUARY": "02", "MARCH": "03", "APRIL": "04",
+    "MAY": "05", "JUNE": "06", "JULY": "07", "AUGUST": "08",
+    "SEPTEMBER": "09", "OCTOBER": "10", "NOVEMBER": "11", "DECEMBER": "12",
+}
+
+
+def _normalizar_fecha(raw: str) -> Optional[str]:
+    """
+    Convierte cualquier formato de fecha a 'DD-MM-YYYY'.
+    Soporta: dd/mm/yyyy, dd-mm-yyyy, '12 de Marzo de 2025', '12 March 2025'.
+    Retorna None si no puede interpretar.
+    """
+    if not raw:
+        return None
+    raw = raw.strip().upper()
+
+    # Texto con nombre de mes (español o inglés)
+    meses = {**_MESES_ES, **_MESES_EN}
+    for nombre, numero in meses.items():
+        if nombre in raw:
+            nums = re.findall(r'\d+', raw)
+            if len(nums) >= 2:
+                dia = nums[0].zfill(2)
+                anio = nums[-1]
+                if len(anio) == 2:
+                    anio = "20" + anio
+                return f"{dia}-{numero}-{anio}"
+
+    # Numérico: dd/mm/yyyy o dd-mm-yyyy
+    m = re.match(r'(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})', raw)
+    if m:
+        dia, mes, anio = m.group(1).zfill(2), m.group(2).zfill(2), m.group(3)
+        if len(anio) == 2:
+            anio = "20" + anio
+        return f"{dia}-{mes}-{anio}"
+
+    return None
+
+
 def _normalizar_pais(raw: str) -> str:
     """Normaliza el país para la glosa de casilla 18."""
     mapa = {
@@ -137,6 +193,117 @@ def _normalizar_pais(raw: str) -> str:
         if k in raw_up:
             return v
     return raw_up
+
+
+# ── Extractor de productos para facturas Australis ───────────────────────────
+#
+# Las facturas Australis tienen las líneas de producto en inglés.
+# Ejemplo:  "17 CAJAS  FRESH ATLANTIC SALMON TRIM D FILLET PREMIUM 2-3 LBS 35 LB  286.05 KG"
+#
+# pdfplumber suele extraer la tabla con columnas:
+#   QTY/BOXES  |  DESCRIPTION  |  NET KG  |  ...
+# Si no puede extraer la tabla, el fallback regex busca líneas que contengan
+# "SALMON" + número de cajas + kilos.
+
+
+def _extraer_productos_australis(texto: str, pdf_path: str) -> list[dict]:
+    """
+    Extrae las líneas de producto de una factura Australis (en inglés).
+
+    Retorna lista de dicts:
+        descripcion    — texto inglés del producto (ej: "FRESH ATLANTIC SALMON TRIM D FILLET PREMIUM 2-3 LBS 35 LB")
+        familia        — igual a descripcion para Australis (se usa completo en casilla 11)
+        cajas_totales  — int
+        kilos_totales  — float (kg netos)
+    """
+    # ── Intento 1: tabla pdfplumber ───────────────────────────────────────────
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+
+                    header = [str(c or "").upper().strip() for c in table[0]]
+                    # Tabla Australis: DESCRIPTION/PRODUCT + QTY/BOXES + NET KG/NET WEIGHT
+                    has_desc = any("DESCRIPTION" in h or "PRODUCT" in h for h in header)
+                    has_qty  = any("QTY" in h or "BOX" in h or "CASES" in h or "CARTON" in h for h in header)
+                    if not has_desc or not has_qty:
+                        continue
+
+                    idx_desc  = next(i for i, h in enumerate(header) if "DESCRIPTION" in h or "PRODUCT" in h)
+                    idx_qty   = next(i for i, h in enumerate(header) if "QTY" in h or "BOX" in h or "CASES" in h or "CARTON" in h)
+                    idx_kg    = next(
+                        (i for i, h in enumerate(header) if "NET" in h and ("KG" in h or "WEIGHT" in h or "KILO" in h)),
+                        next((i for i, h in enumerate(header) if "KG" in h or "KILO" in h), None),
+                    )
+
+                    productos = []
+                    for row in table[1:]:
+                        if not row:
+                            continue
+                        desc_raw = str(row[idx_desc] or "").strip()
+                        qty_raw  = str(row[idx_qty] or "").strip()
+
+                        if not desc_raw or "TOTAL" in desc_raw.upper():
+                            continue
+                        if not any(c.isalpha() for c in desc_raw):
+                            continue
+                        if "SALMON" not in desc_raw.upper():
+                            continue
+
+                        try:
+                            cajas = int(float(qty_raw.replace(",", "").replace(".", "")))
+                        except (ValueError, AttributeError):
+                            cajas = 0
+                        if cajas <= 0:
+                            continue
+
+                        kilos = None
+                        if idx_kg is not None and idx_kg < len(row):
+                            kilos = _extraer_float(str(row[idx_kg] or ""))
+
+                        desc = re.sub(r'\s+', ' ', desc_raw).strip().upper()
+                        productos.append({
+                            "descripcion":   desc,
+                            "familia":       desc,
+                            "kilos_totales": kilos or 0.0,
+                            "cajas_totales": cajas,
+                        })
+
+                    if productos:
+                        return productos
+
+    except Exception as e:
+        print(f"[extractor_facturas] productos Australis tabla error: {e}")
+
+    # ── Intento 2: regex sobre texto ──────────────────────────────────────────
+    productos = []
+    # Patrón: número + descripción con SALMON + kilos
+    patron = re.compile(
+        r'(\d+)\s+'                              # cajas
+        r'((?:FRESH\s+)?ATLANTIC\s+SALMON[^\n]{5,100}?'  # descripción
+        r'(?:\d+[-–]\d+\s*(?:LBS?|KGS?)[^\n]{0,40})?)'   # con talla
+        r'\s+([\d.,]+)\s*(?:KG|KILOS?)?',        # kilos netos
+        re.IGNORECASE
+    )
+    for m in patron.finditer(texto):
+        try:
+            cajas = int(m.group(1))
+        except ValueError:
+            cajas = 0
+        desc  = re.sub(r'\s+', ' ', m.group(2)).strip().upper()
+        kilos = _extraer_float(m.group(3))
+        if cajas > 0 and desc:
+            productos.append({
+                "descripcion":   desc,
+                "familia":       desc,
+                "kilos_totales": kilos or 0.0,
+                "cajas_totales": cajas,
+            })
+
+    return productos
 
 
 # ── Extractor Excel (Blumar y Cermaq envían facturas en .xlsx) ────────────────
@@ -287,6 +454,25 @@ def extraer_datos_factura_excel(path: str) -> Optional[dict]:
                     except Exception:
                         pass
 
+        # ── Fecha ─────────────────────────────────────────────────────────────
+        fecha = None
+        for label in ["INVOICE DATE", "FECHA", "DATE", "FECHA EMISION"]:
+            pos = _buscar_celda_excel(ws, label)
+            if pos:
+                v = _celda_excel(ws, pos[0], pos[1] + 1) or _celda_excel(ws, pos[0] + 1, pos[1])
+                if v:
+                    fecha = _normalizar_fecha(v)
+                    if fecha:
+                        break
+        if not fecha:
+            raw_f = _primera_coincidencia(texto_up, PATRONES_FECHA)
+            fecha = _normalizar_fecha(raw_f) if raw_f else None
+
+        # ── Productos (solo Australis — resto retorna lista vacía) ──────────────
+        productos = []
+        if pesquera == "australis":
+            productos = _extraer_productos_australis(texto_completo, path)
+
         return {
             "tipo":           "factura",
             "pesquera":       pesquera,
@@ -300,6 +486,8 @@ def extraer_datos_factura_excel(path: str) -> Optional[dict]:
             "pais_destino":   pais_destino,
             "cert_sanitario": None,
             "bultos":         bultos,
+            "fecha":          fecha,
+            "productos":      productos,
             "texto_completo": texto_completo,
         }
 
@@ -379,6 +567,15 @@ def extraer_datos_factura(path: str) -> Optional[dict]:
         raw_cert       = _primera_coincidencia(texto_up, PATRONES_CERT)
         cert_sanitario = raw_cert.strip() if raw_cert else None
 
+        # Fecha del documento
+        raw_fecha = _primera_coincidencia(texto_up, PATRONES_FECHA)
+        fecha     = _normalizar_fecha(raw_fecha) if raw_fecha else None
+
+        # Productos (solo Australis — resto retorna lista vacía)
+        productos = []
+        if pesquera == "australis":
+            productos = _extraer_productos_australis(texto, path)
+
         return {
             "tipo":           "factura",
             "pesquera":       pesquera,
@@ -391,6 +588,8 @@ def extraer_datos_factura(path: str) -> Optional[dict]:
             "direccion":      direccion,
             "pais_destino":   pais_destino,
             "cert_sanitario": cert_sanitario,
+            "fecha":          fecha,
+            "productos":      productos,
             "texto_completo": texto,
         }
 

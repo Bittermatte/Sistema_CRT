@@ -54,6 +54,17 @@ def _get(form: dict, key: str) -> str:
     return _fmt(form.get(key))
 
 
+def _kn_cell(kn: str) -> str:
+    """
+    Formatea el valor de kilos netos para la celda del Excel.
+    Si ya viene con prefijo 'CON:' (AquaChile), lo retorna tal cual.
+    Si viene vacío (Blumar/Cermaq/Australis/Multi X — kilos inline), retorna "".
+    """
+    if not kn:
+        return ""
+    return kn if kn.upper().startswith("CON:") else f"CON: {kn} KILOS NETOS"
+
+
 def _fill_workbook(form: dict) -> openpyxl.Workbook:
     """
     Carga la plantilla Excel y llena las celdas variables con los datos del formulario.
@@ -61,8 +72,6 @@ def _fill_workbook(form: dict) -> openpyxl.Workbook:
     """
     wb = load_workbook(PLANTILLA_PATH)
     ws = wb.active
-
-    from modulos.config_cliente import CONFIG_ACTIVO
 
     # ── Casilla 2 — Número CRT ────────────────────────────────────────────────
     ws["F13"] = _get(form, "f_numero_crt")
@@ -77,8 +86,12 @@ def _fill_workbook(form: dict) -> openpyxl.Workbook:
     else:
         ws["A14"] = dir_rem
 
-    # ── Casilla 3 — Transportista ─────────────────────────────────────────────
-    ws["F16"] = CONFIG_ACTIVO["transportista"]
+    # ── Casilla 3 — Transportista (desde form_data, no hardcodeado) ───────────
+    ws["F16"] = _get(form, "f_transportista")
+    dir_trans  = _get(form, "f_dir_transportista") or "Avda Colon 1761 Bahia Blanca BS - AS\nARGENTINA"
+    lines_trans = [l.strip() for l in dir_trans.split("\n") if l.strip()]
+    ws["F17"] = lines_trans[0] if len(lines_trans) > 0 else ""
+    ws["F18"] = lines_trans[1] if len(lines_trans) > 1 else ""
 
     # ── Casilla 4 — Destinatario ──────────────────────────────────────────────
     ws["A18"] = _get(form, "f_destinatario")
@@ -119,19 +132,32 @@ def _fill_workbook(form: dict) -> openpyxl.Workbook:
         # A29:E30 es merge de 2 filas — combinar con \n en A29
         ws["A29"] = "\n".join(lines[:2]) if len(lines) >= 2 else (lines[0] if lines else "")
 
-    # ── Casilla 11 — Descripción de carga ────────────────────────────────────
-    ws["A35"] = _get(form, "f_descripcion_1")
-    kn1 = _get(form, "f_kilos_netos_1")
-    ws["A36"] = f"CON: {kn1} KILOS NETOS" if kn1 else ""
-    ws["A37"] = _get(form, "f_descripcion_2")
-    kn2 = _get(form, "f_kilos_netos_2")
-    ws["A38"] = f"CON: {kn2} KILOS NETOS" if kn2 else ""
+    # ── Casilla 11 — Descripción de carga (hasta 5 líneas) ───────────────────
+    # Filas A35..A39: contenido de producto (desc + kn opcionales)
+    # Filas A40-A42: TOTALES (posición fija en el template)
+    #
+    # Pesqueras con kn inline (Blumar/Cermaq/Australis/Multi X): 1 fila por producto
+    # → caben hasta 5 productos en las filas 35-39
+    # AquaChile con kn separado: 2 filas por producto → caben hasta 2 productos en 35-38
+    row_y = 35
+    for n in range(1, 6):
+        desc_n = _get(form, f"f_descripcion_{n}")
+        kn_n   = _kn_cell(_get(form, f"f_kilos_netos_{n}"))
+        if not desc_n:
+            break
+        if row_y > 39:    # no sobrepasar los TOTALES
+            break
+        ws.cell(row=row_y, column=1).value = desc_n
+        row_y += 1
+        if kn_n and row_y <= 39:
+            ws.cell(row=row_y, column=1).value = kn_n
+            row_y += 1
 
     # ── Casilla 12 — Peso bruto ───────────────────────────────────────────────
     pb = _get(form, "f_peso_bruto")
     ws["G34"] = f"{pb} Kg Brutos" if pb else "Kg Brutos"
 
-    # ── Totales ───────────────────────────────────────────────────────────────
+    # ── Totales (posición fija) ───────────────────────────────────────────────
     total_cajas = _get(form, "f_total_cajas")
     total_kn    = _get(form, "f_peso_neto")
     total_kb    = _get(form, "f_peso_bruto")
@@ -147,11 +173,23 @@ def _fill_workbook(form: dict) -> openpyxl.Workbook:
     # ── Casilla 16 — Declaración valor ───────────────────────────────────────
     ws["F45"] = f"US$  {valor}" if valor else "US$"
 
-    # ── Casilla 15 — Flete total ──────────────────────────────────────────────
-    flete_tot = _get(form, "f_flete_usd")
+    # ── Casilla 15 — Fletes desglosados + total ───────────────────────────────
+    flete_orig = _get(form, "f_flete_origen")
+    flete_fron = _get(form, "f_flete_frontera")
+    flete_tot  = _get(form, "f_flete_usd")
+    if flete_orig:
+        try:
+            ws["B47"] = float(flete_orig.replace(".", "").replace(",", "."))
+        except (ValueError, AttributeError):
+            ws["B47"] = flete_orig
+    if flete_fron:
+        try:
+            ws["B48"] = float(flete_fron.replace(".", "").replace(",", "."))
+        except (ValueError, AttributeError):
+            ws["B48"] = flete_fron
     if flete_tot:
         try:
-            ws["B52"] = float(flete_tot.replace(",", "."))
+            ws["B52"] = float(flete_tot.replace(".", "").replace(",", "."))
         except (ValueError, AttributeError):
             ws["B52"] = flete_tot
 
@@ -170,6 +208,10 @@ def _fill_workbook(form: dict) -> openpyxl.Workbook:
         ws["F55"] = lines[0].strip() if len(lines) > 0 else ""
         ws["F56"] = lines[1].strip() if len(lines) > 1 else ""
         ws["F57"] = lines[2].strip() if len(lines) > 2 else ""
+
+    # ── Casilla 21 — Firma remitente por pesquera ─────────────────────────────
+    firma_rem = _get(form, "f_firma_remitente")
+    ws["A60"] = firma_rem if firma_rem else _get(form, "f_remitente")
 
     # ── Casilla 21/23 — Fechas firma ─────────────────────────────────────────
     fecha_em = _get(form, "f_fecha_emision")

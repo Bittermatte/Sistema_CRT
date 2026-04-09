@@ -259,18 +259,21 @@ def build_crt_pdf(form: dict) -> bytes:
     # ══════════════════════════════════════════════════════════════════════════
     # 4. DATOS FIJOS DEL TRANSPORTISTA (siempre presentes)
     # ══════════════════════════════════════════════════════════════════════════
-    from modulos.config_cliente import CONFIG_ACTIVO
 
-    # Casilla 3 — Transportista (BoldItalic)
-    txt(361.8, 186.0, CONFIG_ACTIVO["transportista"], "Calibri-BoldItalic", 8.3)
-    txt(348.7, 200.0, "Avda Colon 1761 Bahia Blanca BS - AS", "Calibri-BoldItalic", 8.3)
-    txt(397.1, 214.0, "ARGENTINA", "Calibri-BoldItalic", 8.3)
+    # Casilla 3 — Transportista (BoldItalic) — desde form_data
+    transportista = _get(form, "f_transportista")
+    dir_trans = _get(form, "f_dir_transportista") or "Avda Colon 1761 Bahia Blanca BS - AS\nARGENTINA"
+    txt(361.8, 186.0, transportista or "TRANSPORTES VESPRINI S.A", "Calibri-BoldItalic", 8.3)
+    trans_lines = dir_trans.split("\n")
+    txt(348.7, 200.0, trans_lines[0] if trans_lines else "", "Calibri-BoldItalic", 8.3)
+    txt(397.1, 214.0, trans_lines[1] if len(trans_lines) > 1 else "", "Calibri-BoldItalic", 8.3)
 
-    # Casilla 21 — "p.p. REMITENTE" fijo
-    txt(112.5, 713.7, f"p.p. {CONFIG_ACTIVO['remitente']}", "Calibri-Bold", 8.3)
+    # Casilla 21 — "p.p. REMITENTE" — desde form_data
+    firma_remitente = _get(form, "f_firma_remitente")
+    txt(112.5, 713.7, firma_remitente or transportista, "Calibri-Bold", 8.3)
 
     # Casilla 23 — Firma transportista
-    txt(94.2, 838.2, CONFIG_ACTIVO["transportista"], "Arial-Bold", 10.1)
+    txt(94.2, 838.2, transportista or "TRANSPORTES VESPRINI S.A", "Arial-Bold", 10.1)
 
     # ══════════════════════════════════════════════════════════════════════════
     # 5. DATOS VARIABLES DEL FORMULARIO
@@ -322,20 +325,29 @@ def build_crt_pdf(form: dict) -> bytes:
         for i, line_t in enumerate(dir_not.split("\n")[:3]):
             txt(95.6, 345.0 + i * 12.0, line_t.strip(), "Calibri", 6.4)
 
-    # Casilla 11 — Descripción carga
-    txt(60.0, 390.0, "SON:", "Calibri", 8.3)
-    desc1 = _get(form, "f_descripcion_1")
-    kn1   = _get(form, "f_kilos_netos_1")
-    desc2 = _get(form, "f_descripcion_2")
-    kn2   = _get(form, "f_kilos_netos_2")
-    if desc1:
-        txt(60.8, 402.0, desc1, "Calibri-Bold", 7.3)
-        if kn1:
-            txt(60.8, 416.6, f"CON: {kn1} KILOS NETOS", "Calibri", 7.3)
-    if desc2:
-        txt(60.8, 431.5, desc2, "Calibri-Bold", 7.3)
-        if kn2:
-            txt(60.8, 446.3, f"CON: {kn2} KILOS NETOS", "Calibri", 7.3)
+    # Casilla 11 — Descripción carga (hasta 5 líneas de producto)
+    # f_descripcion_N / f_kilos_netos_N  (N = 1..5)
+    # Si kilos_netos está vacío, la descripción ya los lleva inline.
+    Y_DESC_START = 402.0   # primera línea de descripción
+    Y_DESC_MAX   = 519.0   # límite inferior casilla 11 (no sobrepasar)
+    LINE_H       = 14.4    # altura por línea de texto
+    y_cur = Y_DESC_START
+    for n in range(1, 6):
+        desc_n = _get(form, f"f_descripcion_{n}")
+        kn_n   = _get(form, f"f_kilos_netos_{n}")
+        if not desc_n:
+            break
+        if y_cur > Y_DESC_MAX:
+            break
+        txt(60.8, y_cur, desc_n, "Calibri-Bold", 7.3)
+        y_cur += LINE_H
+        if kn_n and y_cur <= Y_DESC_MAX:
+            # kn_n viene del construir_form_data como "CON: X KG NETOS" o solo "X,XX"
+            # Si no comienza con "CON:" lo envolvemos
+            kn_text = kn_n if kn_n.upper().startswith("CON:") else f"CON: {kn_n} KILOS NETOS"
+            txt(60.8, y_cur, kn_text, "Calibri", 7.3)
+            y_cur += LINE_H
+        y_cur += 2.0  # pequeño espacio entre productos
 
     # Casilla 12 — Peso bruto
     pb = _get(form, "f_peso_bruto")

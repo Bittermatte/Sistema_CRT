@@ -4,25 +4,15 @@ Upload → clasificación → extracción → matching → kanban → vista deta
 """
 
 import base64
-import difflib
 import io
-import os
-import re
-import tempfile
-import uuid
 import zipfile
 
 from dash import html, dcc, callback, Input, Output, State, ctx, ALL
 from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
-import dash_iconify as di
 
 from src.dash_ui.theme import COLORS, CARD_STYLE
 from src.services.pdf_service import generate_crt_pdf
-from modulos.extractor_guias import extraer_datos_guia
-from modulos.extractor_facturas import extraer_datos_factura
-from modulos.motor_calculos import calcular_fletes
-from modulos.generador_glosas import generar_textos_crt
 from modulos.config_cliente import CONFIG_ACTIVO
 
 # ---------------------------------------------------------------------------
@@ -55,163 +45,6 @@ def _fmt_cl(val) -> str:
         return s.replace(",", "X").replace(".", ",").replace("X", ".")
     except (TypeError, ValueError):
         return str(val) if val else "—"
-
-
-def _detect_pais(direccion: str | None) -> str:
-    if not direccion:
-        return "MEXICO"
-    d = direccion.upper()
-    for key, val in {
-        "CHINA": "CHINA", "MEXICO": "MEXICO",
-        "ESTADOS UNIDOS": "USA", " USA": "USA",
-        "BRASIL": "BRASIL", "COLOMBIA": "COLOMBIA",
-        "JAPON": "JAPON", "COREA": "COREA",
-        "PERU": "PERU",
-    }.items():
-        if key in d:
-            return val
-    return "MEXICO"
-
-
-# ---------------------------------------------------------------------------
-# Helpers — clasificación y extracción
-# ---------------------------------------------------------------------------
-def _classify_pdf(pdf_bytes: bytes) -> str | None:
-    """Retorna 'guia', 'factura', o None si el PDF no es legible."""
-    try:
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            text = "\n".join(p.extract_text() or "" for p in pdf.pages[:2])
-        if not text.strip():
-            return None
-        if re.search(r"GUIA\s+DE\s+DESPACHO|GU[IÍ]A\s+ELECTR[OÓ]NICA", text, re.IGNORECASE):
-            return "guia"
-        return "factura"
-    except Exception:
-        return None
-
-
-def _extract_pdf(pdf_bytes: bytes, tipo: str) -> dict:
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
-            f.write(pdf_bytes)
-            tmp_path = f.name
-        if tipo == "guia":
-            return extraer_datos_guia(tmp_path)
-        else:
-            return extraer_datos_factura(tmp_path)
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
-
-# ---------------------------------------------------------------------------
-# Helpers — lógica de CRTs
-# ---------------------------------------------------------------------------
-def _find_matching_crt(crts: dict, nombre: str, buscando_tipo: str) -> str | None:
-    """Busca el CRT incompleto cuyo documento existente sea más similar (difflib ≥ 0.50)."""
-    estado_necesario = "FALTA_GUIA" if buscando_tipo == "guia" else "FALTA_FACTURA"
-    nombre_clean = nombre.lower().replace(".pdf", "")
-    best_ratio, best_id = 0.0, None
-    for crt_id, crt in crts.items():
-        if crt["estado"] != estado_necesario:
-            continue
-        existing = (
-            crt.get("nombre_guia") or crt.get("nombre_factura") or ""
-        ).lower().replace(".pdf", "")
-        ratio = difflib.SequenceMatcher(None, nombre_clean, existing).ratio()
-        if ratio >= 0.50 and ratio > best_ratio:
-            best_ratio, best_id = ratio, crt_id
-    return best_id
-
-
-def _build_form_data(crt: dict) -> dict:
-    # IMPORTANTE: las fechas deben entrar como strings "YYYY-MM-DD", nunca como datetime.date
-    # El dcc.Store serializa a JSON y datetime.date no es serializable
-    g  = crt.get("guia_datos")    or {}
-    f  = crt.get("factura_datos") or {}
-    fl = crt.get("fletes")        or {}
-    tx = crt.get("textos")        or {}
-
-    productos = g.get("productos") or []
-    desc1 = kilos1 = desc2 = kilos2 = ""
-    if len(productos) > 0:
-        p = productos[0]
-        desc1  = f"{p['cajas_totales']} CAJAS CON SALMON DEL ATLANTICO {p['familia']}"
-        kilos1 = _fmt_cl(p["kilos_totales"])
-    if len(productos) > 1:
-        p = productos[1]
-        desc2  = f"{p['cajas_totales']} CAJAS CON SALMON DEL ATLANTICO {p['familia']}"
-        kilos2 = _fmt_cl(p["kilos_totales"])
-
-    def _s(v) -> str:
-        return str(v) if v is not None and v != "" else ""
-
-    return {
-        "f_numero_crt":           crt.get("correlativo", ""),
-        "f_remitente":            CONFIG_ACTIVO["remitente"],
-        "f_dir_remitente":        "CAMINO LOS PINOS S/N\nPUERTO MONTT - CHILE",
-        "f_transportista":        CONFIG_ACTIVO["transportista"],
-        "f_destinatario":         f.get("destinatario", ""),
-        "f_dir_destinatario":     f.get("direccion", ""),
-        "f_consignatario":        f.get("destinatario", ""),
-        "f_dir_consignatario":    f.get("direccion", ""),
-        "f_notificar":            f.get("destinatario", ""),
-        "f_dir_notificar":        f.get("direccion", ""),
-        "f_lugar_emision":        CONFIG_ACTIVO["lugar_emision"],
-        "f_lugar_recepcion":      "PUERTO NATALES - CHILE",
-        "f_lugar_entrega":        tx.get("texto_casilla_8", ""),
-        "f_destino_final":        tx.get("texto_casilla_8", ""),
-        "f_instrucciones_aduana": tx.get("texto_casilla_18", ""),
-        "f_incoterm":             f.get("incoterm", ""),
-        "f_valor_mercaderia":     f.get("total", ""),
-        "f_flete_usd":            _s(fl.get("flete_prorrateado")),
-        "f_flete_origen":         _s(fl.get("flete_origen_frontera")),
-        "f_flete_frontera":       _s(fl.get("flete_frontera_destino")),
-        "f_num_factura":          crt.get("nombre_factura", ""),
-        "f_guias_despacho":       _s(g.get("numero_guia")),
-        "f_peso_neto":            g.get("peso_neto"),
-        "f_peso_bruto":           g.get("peso_bruto"),
-        "f_total_cajas":          g.get("bultos"),
-        "f_patente_camion":       g.get("patente_tracto", ""),
-        "f_patente_rampla":       g.get("patente_semi", ""),
-        "f_descripcion_1":        desc1,
-        "f_kilos_netos_1":        kilos1,
-        "f_descripcion_2":        desc2,
-        "f_kilos_netos_2":        kilos2,
-        "f_conductor":            "",
-        "f_fecha_emision":        None,  # string "YYYY-MM-DD" cuando se implemente
-        "f_fecha_documento":      None,
-        "f_fecha_entrega":        None,
-    }
-
-
-def _recalculate_fletes(crts: dict, tarifa: float = CONFIG_ACTIVO["tarifa_flete"]) -> dict:
-    """
-    Agrupa CRTs completos por patente_tracto y prorratea el flete entre todos
-    los que comparten camión, usando la suma de pesos como denominador.
-    """
-    groups: dict[str, list[str]] = {}
-    for crt_id, crt in crts.items():
-        if crt["estado"] != "COMPLETO" or not crt.get("guia_datos"):
-            continue
-        tracto = crt["guia_datos"].get("patente_tracto") or "SIN_PATENTE"
-        groups.setdefault(tracto, []).append(crt_id)
-
-    for tracto, ids in groups.items():
-        total_pb = sum(
-            float(crts[cid]["guia_datos"].get("peso_bruto") or 0)
-            for cid in ids
-        )
-        if total_pb <= 0:
-            continue
-        for cid in ids:
-            pb = float(crts[cid]["guia_datos"].get("peso_bruto") or 0)
-            crts[cid]["fletes"]    = calcular_fletes(pb, total_pb, tarifa)
-            crts[cid]["form_data"] = _build_form_data(crts[cid])
-
-    return crts
 
 
 # ---------------------------------------------------------------------------
@@ -452,9 +285,9 @@ def layout():
     return html.Div([
 
         # ── Elementos invisibles (stores, downloads) ──────────────────────
-        dcc.Store(id="store-crts",        storage_type="memory",
+        dcc.Store(id="store-crts",        storage_type="session",
                   data={"crts": {}, "next_numero": 5098}),
-        dcc.Store(id="store-selected-id", storage_type="memory"),
+        dcc.Store(id="store-selected-id", storage_type="session"),
         dcc.Download(id="download-crt"),
         dcc.Download(id="download-zip"),
 

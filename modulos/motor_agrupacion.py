@@ -316,16 +316,18 @@ def _agrupar_por_destinatario(
 
 def consolidar_productos_australis(grupos: list[GrupoCRT]) -> list[GrupoCRT]:
     """
-    Para Australis: consolida líneas de producto idénticas sumando cajas.
-    Líneas con nombre EXACTAMENTE igual → sumar cajas.
-    Líneas con cualquier diferencia → línea separada.
+    Para Australis: consolida líneas de producto idénticas sumando cajas y kilos.
+    Líneas con descripción EXACTAMENTE igual → se suman.
     Se aplica DESPUÉS de agrupar_documentos().
+
+    Modifica grupo.facturas[0].datos["productos"] con la lista consolidada
+    para que _merge_facturas() del orquestador lo recoja correctamente.
     """
     for grupo in grupos:
-        if grupo.pesquera != "australis":
+        if grupo.pesquera != "australis" or not grupo.facturas:
             continue
 
-        productos: dict[str, dict] = {}
+        acumulados: dict[str, dict] = {}
 
         for factura in grupo.facturas:
             items = factura.datos.get("productos") or []
@@ -333,16 +335,25 @@ def consolidar_productos_australis(grupos: list[GrupoCRT]) -> list[GrupoCRT]:
                 nombre = (item.get("descripcion") or "").strip()
                 if not nombre:
                     continue
-                cajas = item.get("cajas", 0) or 0
-                kilos = item.get("kilos_netos", 0) or 0
+                # Campos reales del extractor: cajas_totales, kilos_totales
+                cajas = item.get("cajas_totales", 0) or 0
+                kilos = item.get("kilos_totales", 0) or 0
 
-                if nombre in productos:
-                    productos[nombre]["cajas"] += cajas
-                    productos[nombre]["kilos_netos"] += kilos
+                if nombre in acumulados:
+                    acumulados[nombre]["cajas_totales"] += cajas
+                    acumulados[nombre]["kilos_totales"] += kilos
                 else:
-                    productos[nombre] = {"cajas": cajas, "kilos_netos": kilos}
+                    acumulados[nombre] = {
+                        "descripcion":   nombre,
+                        "familia":       nombre,
+                        "cajas_totales": cajas,
+                        "kilos_totales": kilos,
+                    }
 
-        grupo.__dict__["productos_consolidados"] = productos
+        # Escribir la lista consolidada en la primera factura del grupo
+        # (el orquestador llama _merge_facturas que toma datos de facturas[0])
+        if grupo.facturas:
+            grupo.facturas[0].datos["productos"] = list(acumulados.values())
 
     return grupos
 

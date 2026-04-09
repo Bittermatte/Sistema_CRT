@@ -16,7 +16,6 @@ import io
 from pathlib import Path
 from typing import Optional
 
-import streamlit as st
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
@@ -287,7 +286,6 @@ def _build_overlay(form: dict) -> bytes:
     return buf.read()
 
 
-@st.cache_data(show_spinner=False)
 def _load_template_bytes() -> Optional[bytes]:
     if not PDF_TEMPLATE_PATH.exists():
         return None

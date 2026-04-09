@@ -6,18 +6,21 @@ Construye las glosas fijas de las casillas 8, 18 y 2.
 import datetime
 
 
-def generar_textos_crt(pais_destino: str, numero_base: int) -> dict:
+def generar_textos_crt(
+    pais_destino: str,
+    numero_base: int,
+    paso_frontera: str = "MONTE AYMOND",
+    aeropuerto: str = "MINISTRO PISTARINI",
+) -> dict:
     """
     Genera los textos de las casillas 8, 18 y el correlativo de la casilla 2.
 
     Parámetros:
-        pais_destino  — país de destino final de la mercadería (ej. 'Mexico')
-        numero_base   — número base del CRT (ej. 5098)
-
-    Retorna un diccionario con:
-        correlativo_casilla_2  — "{numero_base}/{año_actual}VSP"
-        texto_casilla_8        — ruta con destino final
-        texto_casilla_18       — declaración de tránsito completa
+        pais_destino   — país de destino final (ej. 'USA')
+        numero_base    — número base del CRT (ej. 5098)
+        paso_frontera  — paso fronterizo desde config_cliente (default: 'MONTE AYMOND')
+        aeropuerto     — aeropuerto de salida Argentina desde config_cliente
+                         (default: 'MINISTRO PISTARINI')
     """
     pais = pais_destino.upper()
     anio = datetime.datetime.now().year
@@ -25,15 +28,15 @@ def generar_textos_crt(pais_destino: str, numero_base: int) -> dict:
     correlativo_casilla_2 = f"{numero_base}/{anio}VSP"
 
     texto_casilla_8 = (
-        f"AEROPUERTO INT. MINISTRO PISTARINI BUENOS AIRES ARGENTINA"
+        f"AEROPUERTO INT. {aeropuerto} BUENOS AIRES ARGENTINA"
         f"-DESTINO FINAL {pais}"
     )
 
     texto_casilla_18 = (
         f"MERCADERIA PARA SER EXPORTADA A {pais} EN TRANSITO POR LA "
-        f"REPUBLICA ARGENTINA, SALIDA DE CHILE POR EL PASO MONTE AYMOND "
+        f"REPUBLICA ARGENTINA, SALIDA DE CHILE POR EL PASO {paso_frontera} "
         f"Y SALIDA DE ARGENTINA POR EL AEROPUERTO INTERNACIONAL "
-        f"MINISTRO PISTARINI."
+        f"{aeropuerto}."
     )
 
     return {

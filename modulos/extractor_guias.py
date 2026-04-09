@@ -161,6 +161,337 @@ def _extraer_patentes_sii(texto: str) -> tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+# ── Parser de tabla de productos ─────────────────────────────────────────────
+#
+# Las guías SII tienen siempre la misma estructura de tabla:
+#   CODIGO | PRODUCTOS | ... | KILOS | CAJAS | P. UNITARIO | TOTAL
+#
+# pdfplumber puede extraer la tabla como lista de filas.
+# Cuando hay múltiples productos pdfplumber los colapsa en una sola fila
+# con \n dentro de cada celda (así aparece en los documentos reales de AquaChile).
+#
+# La descripción sigue el patrón:
+#   "SALMON DEL ATLANTICO CRUDO Enfriado Refrigerado <CORTE> <TALLA>"
+#   "SALMO SALAR"   ← segunda línea (especie, se descarta)
+#
+# Columnas confirmadas en PDFs reales:
+#   col[0]=CODIGO  col[1]=PRODUCTOS  col[5]=KILOS  col[6]=CAJAS  col[7]=P.UNIT  col[8]=TOTAL
+
+
+def _extraer_float_guia(texto: str) -> Optional[float]:
+    """Convierte '1.827,48' o '1827.48' a float."""
+    if not texto:
+        return None
+    t = str(texto).strip().replace(".", "").replace(",", ".")
+    try:
+        return float(t)
+    except ValueError:
+        try:
+            return float(str(texto).replace(",", ""))
+        except ValueError:
+            return None
+
+
+def _limpiar_desc_cermaq(desc: str) -> str:
+    """
+    Limpia la descripción de productos Cermaq para el CRT.
+
+    Input:  "Enfriado Refrigerado Salmon del Atlantico [Salmo Salar]
+             Eviscerado Entero c/agallas 58 Lbs Poliestireno"
+    Output: "SALMON DEL ATLANTICO ENFRIADO REFRIGERADO EVISCERADO ENTERO C/AGALLAS"
+    """
+    d = desc.upper()
+    # Eliminar especie entre corchetes
+    d = re.sub(r'\[.*?\]', '', d)
+    # Eliminar peso nominal (ej: "58 LBS", "12 KG")
+    d = re.sub(r'\b\d+\s*(?:LBS?|KGS?)\b', '', d, flags=re.IGNORECASE)
+    # Eliminar "POLIESTIRENO"
+    d = re.sub(r'\bPOLIESTIRENO\b', '', d, flags=re.IGNORECASE)
+    # Eliminar "SALMO SALAR" / "ONCORHYNCHUS MYKISS" si quedaron fuera de corchetes
+    d = re.sub(r'\b(?:SALMO\s+SALAR|ONCORHYNCHUS\s+MYKISS)\b', '', d, flags=re.IGNORECASE)
+    # Reordenar: sacar "ENFRIADO REFRIGERADO" al inicio si viene antes del nombre del salmón
+    # Patrón: "ENFRIADO REFRIGERADO SALMON DEL ATLANTICO X Y" → "SALMON DEL ATLANTICO ENFRIADO REFRIGERADO X Y"
+    m = re.match(
+        r'^(ENFRIADO\s+REFRIGERADO)\s+(SALMON\s+DEL\s+ATLANTICO)\s+(.*)',
+        d.strip(), re.IGNORECASE
+    )
+    if m:
+        d = f"{m.group(2)} {m.group(1)} {m.group(3)}"
+    # Normalizar espacios
+    d = re.sub(r'\s+', ' ', d).strip()
+    return d
+
+
+def _parsear_tabla_blumar(pdf_path: str) -> list[dict]:
+    """
+    Parser para guías Blumar: columnas CANTIDAD | DETALLE.
+    CANTIDAD = número de cajas.
+    DETALLE = descripción del producto (puede incluir "(N CJS)" embebido).
+    Los kilos netos se extraen del texto si aparece "KILOS NETOS" en el pie.
+    """
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+
+                    header = [str(c or "").upper().strip() for c in table[0]]
+                    # Tabla Blumar tiene "CANTIDAD" y "DETALLE"
+                    if "CANTIDAD" not in header or "DETALLE" not in header:
+                        continue
+
+                    idx_cant   = next(i for i, h in enumerate(header) if h == "CANTIDAD")
+                    idx_det    = next(i for i, h in enumerate(header) if "DETALLE" in h)
+                    idx_kilos  = next(
+                        (i for i, h in enumerate(header) if "KILO" in h or "KG" in h),
+                        None
+                    )
+                    idx_total  = next(
+                        (i for i, h in enumerate(header) if "TOTAL" in h and i != idx_cant),
+                        None
+                    )
+
+                    productos = []
+                    for row in table[1:]:
+                        if not row:
+                            continue
+                        det_raw  = str(row[idx_det] or "").strip()
+                        cant_raw = str(row[idx_cant] or "").strip()
+
+                        if not det_raw or not any(c.isalpha() for c in det_raw):
+                            continue
+                        if "TOTAL" in det_raw.upper() or "CONSTITUYE" in det_raw.upper():
+                            continue
+                        if not any(c.isdigit() for c in cant_raw):
+                            continue
+
+                        # Extraer cajas — puede estar en cant_raw o embebido "(N CJS)"
+                        cjs_m = re.search(r'\((\d+)\s*CJS?\)', det_raw, re.IGNORECASE)
+                        if cjs_m:
+                            cajas = int(cjs_m.group(1))
+                        else:
+                            try:
+                                cajas = int(float(cant_raw.replace(",", "").replace(".", "")))
+                            except ValueError:
+                                cajas = 0
+
+                        # Kilos netos: desde columna si existe
+                        kilos = None
+                        if idx_kilos is not None and idx_kilos < len(row):
+                            kilos = _extraer_float_guia(str(row[idx_kilos] or ""))
+                        if kilos is None and idx_total is not None and idx_total < len(row):
+                            kilos = _extraer_float_guia(str(row[idx_total] or ""))
+
+                        # Limpiar descripción: quitar "(N CJS)", tallas (ej: "3-4 KG")
+                        desc = re.sub(r'\(\d+\s*CJS?\)', '', det_raw, flags=re.IGNORECASE)
+                        desc = re.sub(r'\b\d+[-–]\d+\s*(?:KG|LB|G)\b', '', desc, flags=re.IGNORECASE)
+                        desc = re.sub(r'\s+', ' ', desc).strip().upper()
+
+                        familia_m = re.search(
+                            r'(?:Refrigerado|REFRIGERADO|CRUDO|ATLANTICO)\s+(.+)',
+                            desc, re.IGNORECASE
+                        )
+                        familia = familia_m.group(1).strip() if familia_m else desc
+
+                        if desc and cajas:
+                            productos.append({
+                                "descripcion":   desc,
+                                "familia":       familia,
+                                "kilos_totales": kilos or 0.0,
+                                "cajas_totales": cajas,
+                            })
+
+                    if productos:
+                        return productos
+
+    except Exception as e:
+        print(f"[extractor_guias] parser Blumar error: {e}")
+
+    return []
+
+
+def _parsear_tabla_productos(pdf_path: str, pesquera: str = "") -> list[dict]:
+    """
+    Extrae la tabla de productos de una guía SII usando pdfplumber.extract_table().
+
+    Retorna lista de dicts con:
+        descripcion    — texto completo del producto (ej: "ENTERO SIN VISCERAS/HON Premium 6-8KG")
+        familia        — corte + talla concatenados
+        cajas_totales  — int
+        kilos_totales  — float (kilos netos de esa línea)
+
+    Pesquera-specific:
+        - blumar / blumar_magallanes → _parsear_tabla_blumar (CANTIDAD|DETALLE)
+        - cermaq → parser estándar + _limpiar_desc_cermaq en cada descripción
+        - australis → retorna [] (productos vienen de la factura)
+        - aquachile / multix → parser estándar SII (CODIGO|PRODUCTOS|KILOS|CAJAS)
+
+    Si extract_table() falla o no encuentra cabecera esperada,
+    intenta el fallback por regex sobre el texto crudo.
+    """
+    # Australis: productos en la factura, no en la guía
+    if pesquera == "australis":
+        return []
+
+    # Blumar: formato CANTIDAD|DETALLE
+    if pesquera in ("blumar", "blumar_magallanes"):
+        result = _parsear_tabla_blumar(pdf_path)
+        if result:
+            return result
+        # Si falla, continúa con el parser genérico por si la guía tiene otro formato
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+
+                    # Verificar que la cabecera corresponde a una tabla de productos SII
+                    header = [str(c or "").upper().strip() for c in table[0]]
+                    if "PRODUCTOS" not in header and "KILOS" not in header:
+                        continue
+
+                    # Encontrar índices de columnas relevantes
+                    try:
+                        idx_prod  = next(i for i, h in enumerate(header) if "PRODUCTO" in h)
+                        idx_kilos = next(i for i, h in enumerate(header) if "KILO" in h)
+                        idx_cajas = next(i for i, h in enumerate(header) if "CAJA" in h)
+                    except StopIteration:
+                        continue
+
+                    productos = []
+                    for row in table[1:]:
+                        if not row or len(row) <= max(idx_prod, idx_kilos, idx_cajas):
+                            continue
+
+                        prod_raw  = str(row[idx_prod] or "").strip()
+                        kilos_raw = str(row[idx_kilos] or "").strip()
+                        cajas_raw = str(row[idx_cajas] or "").strip()
+
+                        # Saltar filas de totales o notas (sin contenido de producto)
+                        if not prod_raw or not any(c.isdigit() for c in kilos_raw):
+                            continue
+                        # Saltar la fila de "No constituye Venta..."
+                        if "CONSTITUYE" in prod_raw.upper() or "TOTAL" in prod_raw.upper()[:20]:
+                            continue
+
+                        # Separar líneas dentro de la celda (múltiples productos colapsados)
+                        lineas_prod  = [l.strip() for l in prod_raw.split("\n") if l.strip()]
+                        lineas_kilos = [l.strip() for l in kilos_raw.split("\n") if l.strip()]
+                        lineas_cajas = [l.strip() for l in cajas_raw.split("\n") if l.strip()]
+
+                        # Reconstruir descripciones completas:
+                        # Las guías SII ponen la talla en la línea siguiente a la descripción.
+                        # Agrupamos: si una línea no empieza con "SALMON" ni "SALMO SALAR"
+                        # la pegamos a la descripción anterior.
+                        lineas_desc = []
+                        for l in lineas_prod:
+                            if re.match(r'^SALMO\s+SALAR\s*$', l.upper()):
+                                continue  # especie — descartar
+                            if (lineas_desc
+                                    and not l.upper().startswith("SALMON")
+                                    and not re.match(r'^\d{4,}$', l)):
+                                # talla o sufijo — pegar a la descripción anterior
+                                lineas_desc[-1] = lineas_desc[-1] + " " + l
+                            else:
+                                lineas_desc.append(l)
+
+                        n = len(lineas_desc)
+                        for i in range(n):
+                            desc = lineas_desc[i]
+
+                            # Cermaq: limpiar descripción cruda de la guía
+                            if pesquera == "cermaq":
+                                desc = _limpiar_desc_cermaq(desc)
+
+                            # Extraer familia: todo lo que sigue a "Refrigerado " o "CRUDO "
+                            familia_m = re.search(
+                                r'(?:Refrigerado|REFRIGERADO|CRUDO)\s+(.+)',
+                                desc, re.IGNORECASE
+                            )
+                            familia = familia_m.group(1).strip() if familia_m else desc
+
+                            kilos = _extraer_float_guia(
+                                lineas_kilos[i] if i < len(lineas_kilos) else ""
+                            )
+                            cajas_str = lineas_cajas[i] if i < len(lineas_cajas) else ""
+                            try:
+                                cajas = int(float(cajas_str.replace(",", "").replace(".", "")))
+                            except (ValueError, AttributeError):
+                                cajas = 0
+
+                            if desc and (kilos or cajas):
+                                productos.append({
+                                    "descripcion":   desc,
+                                    "familia":       familia,
+                                    "kilos_totales": kilos or 0.0,
+                                    "cajas_totales": cajas,
+                                })
+
+                    if productos:
+                        return productos
+
+    except Exception as e:
+        print(f"[extractor_guias] parser tabla error: {e}")
+
+    # ── Fallback: regex sobre texto crudo ─────────────────────────────────────
+    # Busca líneas con el patrón "descripcion kilos cajas precio total"
+    # Cubre el caso de PDFs donde extract_table() no reconoce la tabla
+    return _parsear_tabla_regex(pdf_path)
+
+
+def _parsear_tabla_regex(pdf_path: str) -> list[dict]:
+    """
+    Fallback: extrae productos del texto crudo con regex.
+    Patrón AquaChile/SII: DESCRIPCION <kilos> <cajas> <precio> <total>
+    """
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            texto = "\n".join(p.extract_text() or "" for p in pdf.pages)
+
+        productos = []
+        # Buscar líneas que contengan la descripción característica
+        patron = re.compile(
+            r'(SALMON[^\n]{5,80}?(?:KG|LB|G))'   # descripción hasta la talla
+            r'\s*\n?'
+            r'(?:SALMO\s+SALAR\s*\n?)?'            # especie opcional
+            r'\s*([\d.,]+)'                          # kilos
+            r'\s+([\d.,]+)'                          # cajas
+            r'\s+[\d.,]+'                            # precio unitario (descartado)
+            r'\s+[\d.,]+',                           # total (descartado)
+            re.IGNORECASE
+        )
+        for m in patron.finditer(texto):
+            desc   = m.group(1).strip()
+            kilos  = _extraer_float_guia(m.group(2))
+            try:
+                cajas = int(float(m.group(3).replace(",", "").replace(".", "")))
+            except ValueError:
+                cajas = 0
+
+            familia_m = re.search(
+                r'(?:Refrigerado|REFRIGERADO|CRUDO)\s+(.+)', desc, re.IGNORECASE
+            )
+            familia = familia_m.group(1).strip() if familia_m else desc
+
+            if desc and (kilos or cajas):
+                productos.append({
+                    "descripcion":   desc,
+                    "familia":       familia,
+                    "kilos_totales": kilos or 0.0,
+                    "cajas_totales": cajas,
+                })
+        return productos
+
+    except Exception as e:
+        print(f"[extractor_guias] fallback regex error: {e}")
+        return []
+
+
 # ── Extractor principal ───────────────────────────────────────────────────────
 
 def extraer_datos_guia(pdf_path: str) -> Optional[dict]:
@@ -222,6 +553,14 @@ def extraer_datos_guia(pdf_path: str) -> Optional[dict]:
         raw_ov      = _primera_coincidencia(texto_up, patrones_ov)
         orden_venta = raw_ov.strip() if raw_ov else None
 
+        # Tabla de productos (parser dedicado con fallback regex)
+        productos = _parsear_tabla_productos(pdf_path, pesquera=pesquera)
+
+        # Fecha del documento — reusar patrones de extractor_facturas
+        from modulos.extractor_facturas import PATRONES_FECHA, _normalizar_fecha
+        raw_fecha = _primera_coincidencia(texto_up, PATRONES_FECHA)
+        fecha     = _normalizar_fecha(raw_fecha) if raw_fecha else None
+
         return {
             "tipo":           "guia",
             "pesquera":       pesquera,
@@ -235,8 +574,9 @@ def extraer_datos_guia(pdf_path: str) -> Optional[dict]:
             "conductor":      conductor,
             "cert_sanitario": cert_sanitario,
             "destinatario":   destinatario,
+            "fecha":          fecha,
             "texto_completo": texto,
-            "productos":      [],   # reservado para parser de tabla por pesquera
+            "productos":      productos,
         }
 
     except Exception as e:

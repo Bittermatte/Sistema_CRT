@@ -63,6 +63,37 @@ PATRONES_PAIS = [
     r"\b(USA|CHINA|VIETNAM|MEXICO|M[EÉ]XICO|TAIWAN|RUSSIA|COLOMBIA|PANAMA|ARGENTINA)\b",
 ]
 
+# Ciudad/puerto de destino — para separar CRTs cuando mismo cliente va a distintas ciudades
+PATRONES_CIUDAD_DESTINO = [
+    r"PORT\s+OF\s+(?:DISCHARGE|DESTINATION|ENTRY|DELIVERY)\s*[.:/]\s*([A-Z][A-Z\s,]+?)(?:\n|,|\s{2,}|$)",
+    r"DELIVERY\s+PORT\s*[.:/]\s*([A-Z][A-Z\s]+?)(?:\n|,)",
+    r"PLACE\s+OF\s+DELIVERY\s*[.:/]\s*([A-Z][A-Z\s]+?)(?:\n|,)",
+]
+
+_CIUDADES_CONOCIDAS = [
+    "MIAMI", "LOS ANGELES", "NEW YORK", "SEATTLE", "BOSTON",
+    "CHICAGO", "HOUSTON", "SAN FRANCISCO", "ATLANTA",
+]
+
+
+def _extraer_ciudad(texto_up: str, direccion: Optional[str]) -> str:
+    """
+    Extrae la ciudad/puerto de destino.
+    Primero busca patrones explícitos (PORT OF DISCHARGE etc.),
+    luego busca ciudades conocidas en la dirección del consignatario.
+    Retorna "" si no puede determinarlo.
+    """
+    raw = _primera_coincidencia(texto_up, PATRONES_CIUDAD_DESTINO)
+    if raw:
+        return raw.strip().rstrip(",. ").upper()
+    if direccion:
+        dir_up = direccion.upper()
+        for ciudad in _CIUDADES_CONOCIDAS:
+            if ciudad in dir_up:
+                return ciudad
+    return ""
+
+
 # Certificado sanitario en facturas (algunas lo incluyen)
 PATRONES_CERT = [
     r"CERTIFICADO\s+SANITARIO\s*(?:NRO?|N[°º])\s*[.:/]?\s*(\d+)",
@@ -441,6 +472,9 @@ def extraer_datos_factura_excel(path: str) -> Optional[dict]:
                 raw_pais = m.group(1)
         pais_destino = _normalizar_pais(raw_pais) if raw_pais else "USA"
 
+        # ── Ciudad/puerto de destino ──────────────────────────────────────────
+        ciudad_destino = _extraer_ciudad(texto_up, None)
+
         # ── Bultos (para detección de discrepancias) ──────────────────────────
         bultos = None
         for label in ["TOTAL CAJAS", "TOTAL BOXES", "BULTOS", "PACKAGES", "UNITS"]:
@@ -484,6 +518,7 @@ def extraer_datos_factura_excel(path: str) -> Optional[dict]:
             "destinatario":   destinatario,
             "direccion":      None,
             "pais_destino":   pais_destino,
+            "ciudad_destino": ciudad_destino,
             "cert_sanitario": None,
             "bultos":         bultos,
             "fecha":          fecha,
@@ -563,6 +598,9 @@ def extraer_datos_factura(path: str) -> Optional[dict]:
         raw_pais     = _primera_coincidencia(texto_up, PATRONES_PAIS)
         pais_destino = _normalizar_pais(raw_pais) if raw_pais else "USA"
 
+        # Ciudad/puerto de destino
+        ciudad_destino = _extraer_ciudad(texto_up, direccion)
+
         # Certificado (algunas facturas lo incluyen)
         raw_cert       = _primera_coincidencia(texto_up, PATRONES_CERT)
         cert_sanitario = raw_cert.strip() if raw_cert else None
@@ -586,11 +624,12 @@ def extraer_datos_factura(path: str) -> Optional[dict]:
             "total":          total,
             "destinatario":   destinatario,
             "direccion":      direccion,
-            "pais_destino":   pais_destino,
-            "cert_sanitario": cert_sanitario,
-            "fecha":          fecha,
-            "productos":      productos,
-            "texto_completo": texto,
+            "pais_destino":    pais_destino,
+            "ciudad_destino":  ciudad_destino,
+            "cert_sanitario":  cert_sanitario,
+            "fecha":           fecha,
+            "productos":       productos,
+            "texto_completo":  texto,
         }
 
     except Exception as e:

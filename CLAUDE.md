@@ -28,7 +28,7 @@ pytest --cov=src tests/
 
 ---
 
-## Estado actual del proyecto (2026-04-08)
+## Estado actual del proyecto (2026-04-09)
 
 ### Entry point activo
 
@@ -250,3 +250,51 @@ El orquestador los pasa automáticamente desde `config_pesquera`.
 4. **Persistencia en base de datos**
    - Stubs listos en `src/services/db_service.py` y `src/models/crt.py`
    - Requiere PostgreSQL + SQLAlchemy
+
+---
+
+## Infraestructura / Despliegue
+
+### Estrategia
+
+- **Código fuente**: GitHub (repositorio privado) — fuente de verdad, nunca en el servidor
+- **Servidor de producción**: AWS Lightsail (~$7 USD/mes) — donde corre la app Dash
+- **Base de datos** (Fase 3): AWS RDS PostgreSQL — se agrega cuando se implemente `db_service.py`
+
+### Flujo de deploy
+
+```
+Mac  →  git push  →  GitHub
+                        ↓
+              git pull en Lightsail/EC2
+                        ↓
+              systemctl restart sistema-crt
+```
+
+### Configuración del servidor (Ubuntu 22.04)
+
+```bash
+# Dependencias del sistema
+sudo apt update && sudo apt install -y python3-pip python3-venv git libreoffice-core
+
+# Clonar y preparar
+git clone https://github.com/<usuario>/sistema-crt.git
+cd sistema-crt
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Servicio systemd (para que arranque automáticamente)
+# /etc/systemd/system/sistema-crt.service
+# → ExecStart: /home/ubuntu/sistema-crt/venv/bin/python3 app_dash.py
+sudo systemctl enable sistema-crt
+sudo systemctl start sistema-crt
+```
+
+### Puertos a abrir en Security Group / Firewall
+
+| Puerto | Para qué |
+|--------|----------|
+| 22 | SSH (solo tu IP) |
+| 8051 | App Dash |
+| 80/443 | Si se agrega Nginx al frente |

@@ -26,6 +26,7 @@ class Documento:
     destinatario: str  # nombre del cliente final
     datos: dict        # dict completo del extractor
     pdf_bytes: bytes = field(repr=False, default=b"")
+    ciudad_destino: str = ""  # ciudad/puerto destino (extraído de la factura)
 
 
 @dataclass
@@ -39,6 +40,7 @@ class GrupoCRT:
     guias: list[Documento] = field(default_factory=list)
     facturas: list[Documento] = field(default_factory=list)
     cert_sanitario: Optional[str] = None
+    ciudad_destino: str = ""  # ciudad/puerto destino del grupo
 
     @property
     def completo(self) -> bool:
@@ -191,13 +193,43 @@ def agrupar_documentos(
     if len(destinatarios) == 1:
         dest = (guias[0].destinatario if guias else facturas[0].destinatario)
         if _cliente_agrupa(pesquera, dest):
-            # Un solo CRT con todos los documentos
-            grupos = [GrupoCRT(
-                pesquera=pesquera,
-                destinatario=dest,
-                guias=guias,
-                facturas=facturas,
-            )]
+            # Agrupar facturas por ciudad destino
+            ciudades_facts: dict[str, list] = {}
+            for f in facturas:
+                c = f.ciudad_destino or ""
+                ciudades_facts.setdefault(c, []).append(f)
+
+            if len(ciudades_facts) <= 1:
+                # Una sola ciudad (o desconocida) — un único CRT
+                ciudad = next(iter(ciudades_facts), "")
+                grupos = [GrupoCRT(
+                    pesquera=pesquera,
+                    destinatario=dest,
+                    ciudad_destino=ciudad,
+                    guias=guias,
+                    facturas=facturas,
+                )]
+            else:
+                # Múltiples ciudades → un CRT por ciudad; guías distribuidas FIFO
+                grupos = []
+                guias_pool = list(guias)
+                for ciudad, facts_ciudad in ciudades_facts.items():
+                    n = len(facts_ciudad)
+                    g_asignadas = guias_pool[:n]
+                    guias_pool  = guias_pool[n:]
+                    grupos.append(GrupoCRT(
+                        pesquera=pesquera,
+                        destinatario=dest,
+                        ciudad_destino=ciudad,
+                        guias=g_asignadas,
+                        facturas=facts_ciudad,
+                    ))
+                if guias_pool:
+                    grupos.append(GrupoCRT(
+                        pesquera=pesquera,
+                        destinatario=dest,
+                        guias=guias_pool,
+                    ))
         else:
             # 1 GD + 1 factura = 1 CRT (zip por orden)
             grupos = _agrupar_uno_a_uno(pesquera, guias, facturas)
@@ -267,18 +299,21 @@ def _agrupar_por_destinatario(
 ) -> list[GrupoCRT]:
     """
     Agrupa documentos por destinatario normalizado.
+    Para clientes que agregan, también separa por ciudad_destino (Miami ≠ New York).
     Dentro de cada grupo aplica la regla de agrupación.
     """
     grupos_por_dest: dict[str, GrupoCRT] = {}
 
+    # ── Paso 1: procesar guías ────────────────────────────────────────────────
     for guia in guias:
         dest = _normalizar(guia.destinatario or "DESCONOCIDO")
-        if dest not in grupos_por_dest:
-            grupos_por_dest[dest] = GrupoCRT(
-                pesquera=pesquera,
-                destinatario=guia.destinatario or "",
-            )
         if _cliente_agrupa(pesquera, guia.destinatario or ""):
+            # Guías van a un bucket genérico por dest (sin ciudad — se redistribuirán)
+            if dest not in grupos_por_dest:
+                grupos_por_dest[dest] = GrupoCRT(
+                    pesquera=pesquera,
+                    destinatario=guia.destinatario or "",
+                )
             grupos_por_dest[dest].guias.append(guia)
         else:
             clave = f"{dest}_{guia.numero}"
@@ -288,10 +323,21 @@ def _agrupar_por_destinatario(
                 guias=[guia],
             )
 
+    # ── Paso 2: procesar facturas ─────────────────────────────────────────────
     for factura in facturas:
-        dest = _normalizar(factura.destinatario or "DESCONOCIDO")
-        if dest in grupos_por_dest and _cliente_agrupa(pesquera, factura.destinatario or ""):
-            grupos_por_dest[dest].facturas.append(factura)
+        dest   = _normalizar(factura.destinatario or "DESCONOCIDO")
+        ciudad = _normalizar(factura.ciudad_destino or "")
+
+        if _cliente_agrupa(pesquera, factura.destinatario or ""):
+            # Clave por (dest, ciudad) para separar CRTs por ciudad de destino
+            clave_agrup = f"{dest}_{ciudad}" if ciudad else dest
+            if clave_agrup not in grupos_por_dest:
+                grupos_por_dest[clave_agrup] = GrupoCRT(
+                    pesquera=pesquera,
+                    destinatario=factura.destinatario or "",
+                    ciudad_destino=factura.ciudad_destino or "",
+                )
+            grupos_por_dest[clave_agrup].facturas.append(factura)
         else:
             encontrado = False
             for clave, grupo in grupos_por_dest.items():
@@ -308,6 +354,43 @@ def _agrupar_por_destinatario(
                     destinatario=factura.destinatario or "",
                     facturas=[factura],
                 )
+
+    # ── Paso 3: redistribuir guías del bucket genérico a grupos por ciudad ────
+    # Cuando existen tanto un bucket genérico (key=dest) como grupos por ciudad
+    # (key=dest_ciudad), mover las guías del bucket genérico a los grupos ciudad FIFO.
+    for dest_key in list(grupos_por_dest.keys()):
+        grupo_generico = grupos_por_dest.get(dest_key)
+        if grupo_generico is None or grupo_generico.ciudad_destino:
+            continue  # solo procesar buckets genéricos (sin ciudad)
+        if not grupo_generico.guias:
+            continue
+
+        # Buscar grupos con ciudad específica para este mismo destinatario
+        dest_norm = _normalizar(grupo_generico.destinatario)
+        grupos_ciudad = [
+            (k, g) for k, g in grupos_por_dest.items()
+            if k != dest_key
+            and _normalizar(g.destinatario) == dest_norm
+            and g.ciudad_destino
+        ]
+
+        if not grupos_ciudad:
+            continue  # sin grupos por ciudad → dejar el bucket genérico tal cual
+
+        # Distribuir guías FIFO entre los grupos ciudad
+        guias_pool = list(grupo_generico.guias)
+        for _, g_ciudad in grupos_ciudad:
+            n = len(g_ciudad.facturas)
+            asignadas = guias_pool[:n]
+            guias_pool = guias_pool[n:]
+            g_ciudad.guias.extend(asignadas)
+
+        if guias_pool:
+            # Guías sobrantes van al primer grupo ciudad
+            grupos_ciudad[0][1].guias.extend(guias_pool)
+
+        # Eliminar el bucket genérico ya vacío
+        del grupos_por_dest[dest_key]
 
     return list(grupos_por_dest.values())
 

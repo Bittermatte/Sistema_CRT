@@ -662,6 +662,7 @@ def procesar_documentos(
                 pesquera=datos.get("pesquera") or clave_raw or "DESCONOCIDA",
                 numero=str(datos.get("numero_guia") or datos.get("numero_factura") or ""),
                 destinatario=(datos.get("destinatario") or ""),
+                ciudad_destino=(datos.get("ciudad_destino") or ""),
                 datos=datos,
                 pdf_bytes=file_bytes,
             )

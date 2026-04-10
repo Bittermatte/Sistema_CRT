@@ -28,7 +28,7 @@ from modulos.config_cliente     import CONFIG_ACTIVO, get_config_desde_texto, ge
 from modulos.motor_agrupacion   import Documento, agrupar_documentos, consolidar_productos_australis
 
 # ── Constantes ────────────────────────────────────────────────────────────────
-MATCH_THRESHOLD      = 0.50
+MATCH_THRESHOLD      = 0.80
 ESTADO_COMPLETO      = "COMPLETO"
 ESTADO_FALTA_FACTURA = "FALTA_FACTURA"
 ESTADO_FALTA_GUIA    = "FALTA_GUIA"

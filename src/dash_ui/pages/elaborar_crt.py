@@ -824,7 +824,7 @@ def limpiar_ui(_):
 )
 def confirmar_sugerencia(n_clicks_list, store_data, selected_id):
     from src.services.orchestrator import (
-        construir_form_data, ESTADO_COMPLETO, ESTADO_AMBIGUO
+        construir_form_data, recalcular_fletes, ESTADO_COMPLETO, ESTADO_AMBIGUO
     )
     from modulos.generador_glosas import generar_textos_crt
 
@@ -883,8 +883,11 @@ def confirmar_sugerencia(n_clicks_list, store_data, selected_id):
     crt["correlativo"] = tx.get("correlativo_casilla_2")
     crt["estado"]      = ESTADO_COMPLETO
     crt["sugerencias"] = []
-    crt["form_data"]   = construir_form_data(crt)
     crts[crt_id]       = crt
+
+    # Recalcular fletes para todos los CRTs del camión antes de generar form_data
+    crts = recalcular_fletes(crts)
+    crt["form_data"]   = construir_form_data(crts[crt_id])
 
     store_data["crts"]        = crts
     store_data["next_numero"] = next_num + 1

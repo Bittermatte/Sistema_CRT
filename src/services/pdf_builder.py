@@ -69,7 +69,7 @@ def _get(form: dict, key: str) -> str:
 def _draw_watermark(c) -> None:
     """Estampa 'BORRADOR NO OFICIAL' en diagonal sobre el canvas actual."""
     c.saveState()
-    c.setFillColorRGB(0.75, 0.0, 0.0, alpha=0.18)
+    c.setFillColor(Color(0.75, 0.0, 0.0, alpha=0.18))
     c.setFont("Arial-Bold", 52)
     c.translate(W / 2, H / 2)
     c.rotate(42)

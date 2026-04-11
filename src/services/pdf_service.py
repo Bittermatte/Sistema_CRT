@@ -16,7 +16,11 @@ import io
 from pathlib import Path
 from typing import Optional
 
-from pypdf import PdfReader, PdfWriter
+try:
+    from pypdf import PdfReader, PdfWriter
+    _PYPDF_AVAILABLE = True
+except ImportError:
+    _PYPDF_AVAILABLE = False
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -346,7 +350,7 @@ def generate_crt_pdf(form_data: dict) -> tuple[Optional[bytes], bool]:
 # Deprecated — el frontend Dash usa generate_crt_pdf() + iframe base64
 def render_pdf_preview(form_data: dict) -> Optional[bytes]:
     """Renderiza el PDF como PNG para la vista previa en Streamlit."""
-    pdf_bytes = generate_crt_pdf(form_data)
+    pdf_bytes, _ = generate_crt_pdf(form_data)
     if pdf_bytes is None:
         return None
     try:

@@ -26,12 +26,14 @@ from modulos.motor_calculos     import calcular_fletes
 from modulos.generador_glosas   import generar_textos_crt
 from modulos.config_cliente     import CONFIG_ACTIVO, get_config_desde_texto, get_config
 from modulos.motor_agrupacion   import Documento, agrupar_documentos, consolidar_productos_australis
+from src.services.audit_log     import log_extraccion
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 MATCH_THRESHOLD      = 0.80
 ESTADO_COMPLETO      = "COMPLETO"
 ESTADO_FALTA_FACTURA = "FALTA_FACTURA"
 ESTADO_FALTA_GUIA    = "FALTA_GUIA"
+ESTADO_AMBIGUO       = "AMBIGUO"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _extraer_texto_raw(pdf_bytes: bytes) -> str:
@@ -227,18 +229,23 @@ def buscar_match_guia(factura_datos: dict, crts: dict) -> Optional[str]:
         if mejor_id:
             return mejor_id
 
-    # Capa 3: misma pesquera + único candidato
-    pesquera_f = factura_datos.get("pesquera", "DESCONOCIDA")
-    if pesquera_f != "DESCONOCIDA":
-        candidatos = [
-            crt_id for crt_id, crt in crts.items()
-            if crt.get("estado") == ESTADO_FALTA_FACTURA
-            and crt.get("pesquera") == pesquera_f
-        ]
-        if len(candidatos) == 1:
-            return candidatos[0]
+    # Capa 3: misma pesquera — NO auto-matchea, retorna None para que el
+    # orquestador cree el estado AMBIGUO con los candidatos como sugerencias.
+    # (La lógica de sugerencias vive en procesar_documentos)
 
     return None
+
+
+def _candidatos_capa3_guia(factura_datos: dict, crts: dict) -> list[str]:
+    """Retorna IDs de CRTs FALTA_FACTURA de la misma pesquera (Capa 3)."""
+    pesquera_f = factura_datos.get("pesquera", "DESCONOCIDA")
+    if pesquera_f == "DESCONOCIDA":
+        return []
+    return [
+        crt_id for crt_id, crt in crts.items()
+        if crt.get("estado") == ESTADO_FALTA_FACTURA
+        and crt.get("pesquera") == pesquera_f
+    ]
 
 
 def buscar_match_factura(guia_datos: dict, crts: dict) -> Optional[str]:
@@ -284,18 +291,20 @@ def buscar_match_factura(guia_datos: dict, crts: dict) -> Optional[str]:
         if mejor_id:
             return mejor_id
 
-    # Capa 3: misma pesquera + único candidato
-    pesquera_g = guia_datos.get("pesquera", "DESCONOCIDA")
-    if pesquera_g != "DESCONOCIDA":
-        candidatos = [
-            crt_id for crt_id, crt in crts.items()
-            if crt.get("estado") == ESTADO_FALTA_GUIA
-            and crt.get("pesquera") == pesquera_g
-        ]
-        if len(candidatos) == 1:
-            return candidatos[0]
-
+    # Capa 3: misma pesquera — NO auto-matchea (ver _candidatos_capa3_factura)
     return None
+
+
+def _candidatos_capa3_factura(guia_datos: dict, crts: dict) -> list[str]:
+    """Retorna IDs de CRTs FALTA_GUIA de la misma pesquera (Capa 3)."""
+    pesquera_g = guia_datos.get("pesquera", "DESCONOCIDA")
+    if pesquera_g == "DESCONOCIDA":
+        return []
+    return [
+        crt_id for crt_id, crt in crts.items()
+        if crt.get("estado") == ESTADO_FALTA_GUIA
+        and crt.get("pesquera") == pesquera_g
+    ]
 
 
 # ── Prorrateo de fletes ───────────────────────────────────────────────────────
@@ -652,14 +661,18 @@ def procesar_documentos(
                 continue
 
             # Enriquecer pesquera desde texto bruto si extractor no la detectó
+            # (se hace antes del log para que la pesquera quede registrada correctamente)
             texto_raw = _extraer_texto_raw(file_bytes)
             clave_raw, _ = get_config_desde_texto(texto_raw)
             if not datos.get("pesquera") or datos["pesquera"] == "DESCONOCIDA":
                 datos["pesquera"] = clave_raw
 
+            pesquera_final = datos.get("pesquera") or clave_raw or "DESCONOCIDA"
+            log_extraccion(nombre, tipo, pesquera_final, datos)
+
             doc = Documento(
                 tipo=tipo,
-                pesquera=datos.get("pesquera") or clave_raw or "DESCONOCIDA",
+                pesquera=pesquera_final,
                 numero=str(datos.get("numero_guia") or datos.get("numero_factura") or ""),
                 destinatario=(datos.get("destinatario") or ""),
                 ciudad_destino=(datos.get("ciudad_destino") or ""),
@@ -746,23 +759,39 @@ def procesar_documentos(
                     errores.extend(f"DISCREPANCIA:{a}" for a in avisos)
                     next_num += 1
                 else:
+                    # Capa 3: buscar facturas huérfanas de la misma pesquera
+                    candidatos_c3 = _candidatos_capa3_factura(guia_datos, crts)
                     crt_id = str(uuid.uuid4())
-                    crts[crt_id] = {
-                        "id":             crt_id,
-                        "estado":         ESTADO_FALTA_FACTURA,
-                        "guia_datos":     guia_datos,
-                        "factura_datos":  None,
-                        "fletes":         None,
-                        "textos":         None,
-                        "form_data":      None,
-                        "correlativo":    None,
-                        "destinatario":   guia_datos.get("destinatario") or "—",
-                        "pesquera":       clave_pesquera,
-                        "config":         config_pesquera,
-                        "nombre_guia":    nombre_guia,
-                        "nombre_factura": None,
-                    }
-                    crts[crt_id]["form_data"] = construir_form_data(crts[crt_id])
+                    if candidatos_c3:
+                        # Marcar CRT existente FALTA_GUIA como AMBIGUO con sugerencia
+                        sugerencia = {
+                            "tipo":           "guia",
+                            "datos":          guia_datos,
+                            "nombre_archivo": nombre_guia,
+                            "capa":           3,
+                        }
+                        for c_id in candidatos_c3:
+                            existing = crts[c_id]
+                            existing["estado"] = ESTADO_AMBIGUO
+                            existing.setdefault("sugerencias", []).append(sugerencia)
+                    else:
+                        crts[crt_id] = {
+                            "id":             crt_id,
+                            "estado":         ESTADO_FALTA_FACTURA,
+                            "guia_datos":     guia_datos,
+                            "factura_datos":  None,
+                            "sugerencias":    [],
+                            "fletes":         None,
+                            "textos":         None,
+                            "form_data":      None,
+                            "correlativo":    None,
+                            "destinatario":   guia_datos.get("destinatario") or "—",
+                            "pesquera":       clave_pesquera,
+                            "config":         config_pesquera,
+                            "nombre_guia":    nombre_guia,
+                            "nombre_factura": None,
+                        }
+                        crts[crt_id]["form_data"] = construir_form_data(crts[crt_id])
 
             elif grupo.facturas and not grupo.guias:
                 # ── Solo facturas — buscar guía huérfana en el store ─────────
@@ -789,23 +818,39 @@ def procesar_documentos(
                     errores.extend(f"DISCREPANCIA:{a}" for a in avisos)
                     next_num += 1
                 else:
+                    # Capa 3: buscar guías huérfanas de la misma pesquera
+                    candidatos_c3 = _candidatos_capa3_guia(factura_datos, crts)
                     crt_id = str(uuid.uuid4())
-                    crts[crt_id] = {
-                        "id":             crt_id,
-                        "estado":         ESTADO_FALTA_GUIA,
-                        "factura_datos":  factura_datos,
-                        "guia_datos":     None,
-                        "fletes":         None,
-                        "textos":         None,
-                        "form_data":      None,
-                        "correlativo":    None,
-                        "destinatario":   factura_datos.get("destinatario", "—"),
-                        "pesquera":       clave_pesquera,
-                        "config":         config_pesquera,
-                        "nombre_guia":    None,
-                        "nombre_factura": nombre_factura,
-                    }
-                    crts[crt_id]["form_data"] = construir_form_data(crts[crt_id])
+                    if candidatos_c3:
+                        # Marcar CRT existente FALTA_FACTURA como AMBIGUO con sugerencia
+                        sugerencia = {
+                            "tipo":           "factura",
+                            "datos":          factura_datos,
+                            "nombre_archivo": nombre_factura,
+                            "capa":           3,
+                        }
+                        for c_id in candidatos_c3:
+                            existing = crts[c_id]
+                            existing["estado"] = ESTADO_AMBIGUO
+                            existing.setdefault("sugerencias", []).append(sugerencia)
+                    else:
+                        crts[crt_id] = {
+                            "id":             crt_id,
+                            "estado":         ESTADO_FALTA_GUIA,
+                            "factura_datos":  factura_datos,
+                            "guia_datos":     None,
+                            "sugerencias":    [],
+                            "fletes":         None,
+                            "textos":         None,
+                            "form_data":      None,
+                            "correlativo":    None,
+                            "destinatario":   factura_datos.get("destinatario", "—"),
+                            "pesquera":       clave_pesquera,
+                            "config":         config_pesquera,
+                            "nombre_guia":    None,
+                            "nombre_factura": nombre_factura,
+                        }
+                        crts[crt_id]["form_data"] = construir_form_data(crts[crt_id])
 
         except Exception as e:
             errores.append(f"Error procesando grupo ({grupo.pesquera}): {e}")

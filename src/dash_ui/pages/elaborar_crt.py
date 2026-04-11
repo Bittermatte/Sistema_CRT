@@ -13,7 +13,10 @@ import dash_bootstrap_components as dbc
 
 from src.dash_ui.theme import COLORS, CARD_STYLE
 from src.services.pdf_service import generate_crt_pdf
+from src.services.audit_log import log_descarga
 from modulos.config_cliente import CONFIG_ACTIVO
+
+ESTADO_AMBIGUO = "AMBIGUO"
 
 # ---------------------------------------------------------------------------
 # Estilos locales reutilizables
@@ -55,6 +58,7 @@ def _badge(estado: str) -> html.Span:
         "COMPLETO":      (COLORS["success"], "✅ COMPLETO"),
         "FALTA_FACTURA": (COLORS["warning"], "⚠️ FALTA FACTURA"),
         "FALTA_GUIA":    (COLORS["warning"], "⚠️ FALTA GUÍA"),
+        "AMBIGUO":       ("#d97706",         "? AMBIGUO — Requiere selección"),
     }
     color, text = cfg.get(estado, ("#aaa", estado))
     return html.Span(text, style={
@@ -207,6 +211,83 @@ def _render_crt_detail(crt: dict) -> html.Div:
     if doc_items:
         children += [_section_hdr("Documentos"), *doc_items]
 
+    # ── Panel AMBIGUO: lista de sugerencias con botones de acción ────────────
+    if crt["estado"] == ESTADO_AMBIGUO:
+        sugerencias = crt.get("sugerencias") or []
+        sug_items = []
+        for idx, sug in enumerate(sugerencias):
+            tipo      = sug.get("tipo", "documento")
+            datos     = sug.get("datos") or {}
+            nombre_a  = sug.get("nombre_archivo") or "—"
+            dest      = datos.get("destinatario") or "—"
+            num       = datos.get("numero_factura") or datos.get("numero_guia") or "—"
+            pesquera  = datos.get("pesquera") or "—"
+            btn_id    = {"type": "btn-confirmar-sugerencia", "index": f"{crt['id']}__{idx}"}
+            sug_items.append(html.Div(
+                style={
+                    "border":        f"1px solid #d97706",
+                    "borderRadius":  "8px",
+                    "padding":       "8px 10px",
+                    "marginBottom":  "6px",
+                    "backgroundColor": "#fffbeb",
+                },
+                children=[
+                    html.Div([
+                        html.Span(f"📄 {nombre_a}",
+                                  style={"fontSize": "11px", "fontWeight": "700",
+                                         "color": "#92400e", "display": "block",
+                                         "marginBottom": "4px"}),
+                        html.Span(f"Destinatario: {dest}",
+                                  style={"fontSize": "10px", "color": "#555",
+                                         "display": "block"}),
+                        html.Span(f"N°: {num} | Pesquera: {pesquera}",
+                                  style={"fontSize": "10px", "color": "#777",
+                                         "display": "block", "marginBottom": "6px"}),
+                    ]),
+                    dbc.Button(
+                        f"✔ Confirmar esta {tipo}",
+                        id=btn_id,
+                        size="sm",
+                        style={
+                            "width":           "100%",
+                            "borderRadius":    "6px",
+                            "backgroundColor": "#d97706",
+                            "border":          "none",
+                            "color":           "#fff",
+                            "fontWeight":      "600",
+                            "fontSize":        "11px",
+                        },
+                    ),
+                ],
+            ))
+        children += [
+            _section_hdr("Selecciona el documento correcto"),
+            html.Div(
+                style={"backgroundColor": "#fffbeb", "borderRadius": "8px",
+                       "padding": "8px", "marginBottom": "6px",
+                       "border": "1px solid #fcd34d", "fontSize": "11px",
+                       "color": "#92400e"},
+                children="El sistema encontró un posible match por pesquera (Capa 3). "
+                         "Confirma si es el documento correcto o descártalo.",
+            ),
+            *sug_items,
+            dbc.Button(
+                "✖ Descartar sugerencias",
+                id={"type": "btn-descartar-sugerencias", "index": crt["id"]},
+                size="sm",
+                style={
+                    "width":           "100%",
+                    "borderRadius":    "6px",
+                    "border":          f"1px solid {COLORS['danger']}",
+                    "color":           COLORS["danger"],
+                    "backgroundColor": "transparent",
+                    "fontWeight":      "600",
+                    "fontSize":        "11px",
+                    "marginTop":       "4px",
+                },
+            ),
+        ]
+
     children += [
         html.Hr(style={"borderColor": COLORS["border"], "margin": "12px 0"}),
         dbc.Button(
@@ -288,8 +369,65 @@ def layout():
         dcc.Store(id="store-crts",        storage_type="session",
                   data={"crts": {}, "next_numero": 5098}),
         dcc.Store(id="store-selected-id", storage_type="session"),
+        dcc.Store(id="store-pdf-pending", storage_type="memory"),
         dcc.Download(id="download-crt"),
         dcc.Download(id="download-zip"),
+
+        # ── Modal: advertencia PDF fallback ───────────────────────────────
+        dbc.Modal(
+            id="modal-fallback-pdf",
+            is_open=False,
+            centered=True,
+            children=[
+                dbc.ModalHeader(
+                    html.Span("⚠️ Documento no oficial", style={"color": "#b91c1c", "fontWeight": "700"}),
+                    close_button=True,
+                ),
+                dbc.ModalBody([
+                    html.P(
+                        "LibreOffice no está disponible. El PDF fue generado con el motor "
+                        "de respaldo (ReportLab), que usa coordenadas aproximadas.",
+                        style={"marginBottom": "10px", "fontSize": "13px"},
+                    ),
+                    html.Div(
+                        "Un CRT con coordenadas incorrectas puede ser rechazado en Aduana. "
+                        "Se ha estampado la marca 'BORRADOR NO OFICIAL' para indicar que este "
+                        "documento no es el formato definitivo.",
+                        style={
+                            "backgroundColor": "#fef2f2",
+                            "border":          "1px solid #fca5a5",
+                            "borderRadius":    "6px",
+                            "padding":         "10px",
+                            "fontSize":        "12px",
+                            "color":           "#7f1d1d",
+                        },
+                    ),
+                ]),
+                dbc.ModalFooter([
+                    dbc.Button(
+                        "Descargar igual (bajo mi responsabilidad)",
+                        id="btn-modal-confirmar-fallback",
+                        style={
+                            "backgroundColor": "#b91c1c",
+                            "border":          "none",
+                            "color":           "#fff",
+                            "fontWeight":      "600",
+                            "fontSize":        "12px",
+                        },
+                    ),
+                    dbc.Button(
+                        "Cancelar",
+                        id="btn-modal-cancelar-fallback",
+                        style={
+                            "backgroundColor": "transparent",
+                            "border":          f"1px solid {COLORS['border']}",
+                            "color":           COLORS["text_secondary"],
+                            "fontSize":        "12px",
+                        },
+                    ),
+                ]),
+            ],
+        ),
 
         # ── Alertas ───────────────────────────────────────────────────────
         html.Div(id="alert-container", style={"marginBottom": "12px"}),
@@ -510,14 +648,23 @@ def seleccionar_crt(n_clicks_list, store_data):
 
     if crt.get("form_data"):
         try:
-            pdf_bytes = generate_crt_pdf(crt["form_data"])
+            pdf_bytes, is_fallback = generate_crt_pdf(crt["form_data"])
             if pdf_bytes:
                 b64     = base64.b64encode(pdf_bytes).decode()
                 pdf_src = (
                     f"data:application/pdf;base64,{b64}"
                     "#toolbar=0&navpanes=0&scrollbar=0&view=FitH"
                 )
-                preview = _render_pdf_iframe(pdf_src)
+                preview_children = [_render_pdf_iframe(pdf_src)]
+                if is_fallback:
+                    preview_children.insert(0, dbc.Alert(
+                        "⚠️ Vista previa generada con motor de respaldo (ReportLab). "
+                        "Coordenadas aproximadas — no apto para Aduana.",
+                        color="warning",
+                        style={"fontSize": "12px", "marginBottom": "6px", "padding": "8px 12px"},
+                        dismissable=True,
+                    ))
+                preview = html.Div(preview_children)
         except Exception:
             pass
 
@@ -526,12 +673,16 @@ def seleccionar_crt(n_clicks_list, store_data):
 
 # ---------------------------------------------------------------------------
 # Callback 4 — Descargar CRT individual
+# Si is_fallback: guarda PDF en store-pdf-pending y abre modal de advertencia
+# Si no: descarga directamente y loguea en audit log
 # ---------------------------------------------------------------------------
 @callback(
-    Output("download-crt",  "data"),
-    Input("btn-descargar-crt", "n_clicks"),
-    State("store-selected-id", "data"),
-    State("store-crts",        "data"),
+    Output("download-crt",        "data"),
+    Output("modal-fallback-pdf",  "is_open"),
+    Output("store-pdf-pending",   "data"),
+    Input("btn-descargar-crt",    "n_clicks"),
+    State("store-selected-id",    "data"),
+    State("store-crts",           "data"),
     prevent_initial_call=True,
 )
 def descargar_crt(n_clicks, selected_id, store_data):
@@ -541,12 +692,78 @@ def descargar_crt(n_clicks, selected_id, store_data):
     crt  = crts.get(selected_id)
     if not crt or not crt.get("form_data"):
         raise PreventUpdate
-    pdf_bytes = generate_crt_pdf(crt["form_data"])
+    pdf_bytes, is_fallback = generate_crt_pdf(crt["form_data"])
     if not pdf_bytes:
         raise PreventUpdate
     correlativo = (crt.get("correlativo") or "borrador").replace("/", "-")
-    sufijo = "" if crt["estado"] == "COMPLETO" else "_borrador"
-    return dcc.send_bytes(pdf_bytes, f"CRT_{correlativo}{sufijo}.pdf")
+    sufijo      = "" if crt["estado"] == "COMPLETO" else "_borrador"
+    filename    = f"CRT_{correlativo}{sufijo}.pdf"
+
+    if is_fallback:
+        # Guardar en store pendiente y mostrar modal — no descargar todavía
+        pending = {
+            "pdf_b64":  base64.b64encode(pdf_bytes).decode(),
+            "filename": filename,
+        }
+        return None, True, pending
+
+    # Descarga directa + audit log
+    log_descarga(
+        crt_id=selected_id,
+        correlativo=crt.get("correlativo"),
+        estado=crt["estado"],
+        form_data_final=crt.get("form_data") or {},
+        guia_datos=crt.get("guia_datos"),
+        factura_datos=crt.get("factura_datos"),
+        is_fallback=False,
+    )
+    return dcc.send_bytes(pdf_bytes, filename), False, None
+
+
+# ---------------------------------------------------------------------------
+# Callback 4b — Confirmar descarga fallback desde modal
+# ---------------------------------------------------------------------------
+@callback(
+    Output("download-crt",       "data",    allow_duplicate=True),
+    Output("modal-fallback-pdf", "is_open", allow_duplicate=True),
+    Input("btn-modal-confirmar-fallback", "n_clicks"),
+    State("store-pdf-pending",   "data"),
+    State("store-selected-id",   "data"),
+    State("store-crts",          "data"),
+    prevent_initial_call=True,
+)
+def confirmar_descarga_fallback(n_clicks, pending, selected_id, store_data):
+    if not pending or not pending.get("pdf_b64"):
+        raise PreventUpdate
+    pdf_bytes = base64.b64decode(pending["pdf_b64"])
+    filename  = pending.get("filename", "CRT_borrador.pdf")
+
+    # Audit log con is_fallback=True
+    crts = (store_data or {}).get("crts", {})
+    crt  = crts.get(selected_id) if selected_id else None
+    if crt:
+        log_descarga(
+            crt_id=selected_id,
+            correlativo=crt.get("correlativo"),
+            estado=crt["estado"],
+            form_data_final=crt.get("form_data") or {},
+            guia_datos=crt.get("guia_datos"),
+            factura_datos=crt.get("factura_datos"),
+            is_fallback=True,
+        )
+    return dcc.send_bytes(pdf_bytes, filename), False
+
+
+# ---------------------------------------------------------------------------
+# Callback 4c — Cancelar modal fallback
+# ---------------------------------------------------------------------------
+@callback(
+    Output("modal-fallback-pdf", "is_open", allow_duplicate=True),
+    Input("btn-modal-cancelar-fallback", "n_clicks"),
+    prevent_initial_call=True,
+)
+def cancelar_modal_fallback(_):
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +784,7 @@ def descargar_zip(n_clicks, store_data):
             if crt["estado"] != "COMPLETO" or not crt.get("form_data"):
                 continue
             try:
-                pdf_bytes = generate_crt_pdf(crt["form_data"])
+                pdf_bytes, _ = generate_crt_pdf(crt["form_data"])
                 if pdf_bytes:
                     fname = f"CRT_{(crt.get('correlativo') or 'sin_numero').replace('/', '-')}.pdf"
                     zf.writestr(fname, pdf_bytes)
@@ -592,3 +809,120 @@ def descargar_zip(n_clicks, store_data):
 )
 def limpiar_ui(_):
     return None, _render_empty_preview(), _render_empty_detail()
+
+
+# ---------------------------------------------------------------------------
+# Callback 7 — Confirmar sugerencia AMBIGUO → COMPLETO
+# ---------------------------------------------------------------------------
+@callback(
+    Output("store-crts",        "data",     allow_duplicate=True),
+    Output("store-selected-id", "data",     allow_duplicate=True),
+    Input({"type": "btn-confirmar-sugerencia", "index": ALL}, "n_clicks"),
+    State("store-crts",         "data"),
+    State("store-selected-id",  "data"),
+    prevent_initial_call=True,
+)
+def confirmar_sugerencia(n_clicks_list, store_data, selected_id):
+    from src.services.orchestrator import (
+        construir_form_data, ESTADO_COMPLETO, ESTADO_AMBIGUO
+    )
+    from modulos.generador_glosas import generar_textos_crt
+
+    if not any(n_clicks_list):
+        raise PreventUpdate
+    triggered = ctx.triggered_id
+    if not triggered:
+        raise PreventUpdate
+
+    # Parsear crt_id e idx del index compuesto "crt_id__idx"
+    raw_index = triggered["index"]
+    if "__" not in raw_index:
+        raise PreventUpdate
+    crt_id, idx_str = raw_index.rsplit("__", 1)
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        raise PreventUpdate
+
+    store_data = store_data or {"crts": {}, "next_numero": 5098}
+    crts       = store_data.get("crts", {})
+    crt        = crts.get(crt_id)
+    if not crt or crt.get("estado") != ESTADO_AMBIGUO:
+        raise PreventUpdate
+
+    sugerencias = crt.get("sugerencias") or []
+    if idx >= len(sugerencias):
+        raise PreventUpdate
+
+    sug      = sugerencias[idx]
+    tipo     = sug.get("tipo")
+    datos    = sug.get("datos") or {}
+    nombre_a = sug.get("nombre_archivo")
+
+    # Merge: la sugerencia completa el documento que faltaba
+    if tipo == "factura":
+        crt["factura_datos"]  = datos
+        crt["nombre_factura"] = nombre_a
+        pais = datos.get("pais_destino", "USA")
+    elif tipo == "guia":
+        crt["guia_datos"]  = datos
+        crt["nombre_guia"] = nombre_a
+        pais = (crt.get("factura_datos") or {}).get("pais_destino", "USA")
+    else:
+        raise PreventUpdate
+
+    config  = crt.get("config") or {}
+    next_num = store_data.get("next_numero", 5000)
+    tx = generar_textos_crt(
+        pais_destino=pais,
+        numero_base=next_num,
+        paso_frontera=config.get("paso_frontera", "MONTE AYMOND"),
+        aeropuerto=config.get("aeropuerto", "MINISTRO PISTARINI"),
+    )
+    crt["textos"]      = tx
+    crt["correlativo"] = tx.get("correlativo_casilla_2")
+    crt["estado"]      = ESTADO_COMPLETO
+    crt["sugerencias"] = []
+    crt["form_data"]   = construir_form_data(crt)
+    crts[crt_id]       = crt
+
+    store_data["crts"]        = crts
+    store_data["next_numero"] = next_num + 1
+    return store_data, crt_id
+
+
+# ---------------------------------------------------------------------------
+# Callback 8 — Descartar sugerencias AMBIGUO → vuelve a FALTA_*
+# ---------------------------------------------------------------------------
+@callback(
+    Output("store-crts", "data", allow_duplicate=True),
+    Input({"type": "btn-descartar-sugerencias", "index": ALL}, "n_clicks"),
+    State("store-crts",  "data"),
+    prevent_initial_call=True,
+)
+def descartar_sugerencias(n_clicks_list, store_data):
+    from src.services.orchestrator import ESTADO_FALTA_FACTURA, ESTADO_FALTA_GUIA
+
+    if not any(n_clicks_list):
+        raise PreventUpdate
+    triggered = ctx.triggered_id
+    if not triggered:
+        raise PreventUpdate
+
+    crt_id     = triggered["index"]
+    store_data = store_data or {"crts": {}, "next_numero": 5098}
+    crts       = store_data.get("crts", {})
+    crt        = crts.get(crt_id)
+    if not crt:
+        raise PreventUpdate
+
+    # Determinar a qué estado volver según qué documento ya tiene
+    if crt.get("guia_datos") and not crt.get("factura_datos"):
+        crt["estado"] = ESTADO_FALTA_FACTURA
+    else:
+        crt["estado"] = ESTADO_FALTA_GUIA
+
+    crt["sugerencias"] = []
+    crts[crt_id]       = crt
+    store_data["crts"] = crts
+    return store_data

@@ -314,10 +314,14 @@ def _load_template_bytes() -> Optional[bytes]:
 # Nuevo generador (desde cero, sin merge)
 from src.services.pdf_builder import build_crt_pdf
 
-def generate_crt_pdf(form_data: dict) -> Optional[bytes]:
+def generate_crt_pdf(form_data: dict) -> tuple[Optional[bytes], bool]:
     """
     Genera el PDF CRT. Usa Excel+LibreOffice si está disponible,
     sino cae al builder ReportLab como fallback.
+
+    Retorna: (pdf_bytes, is_fallback)
+      is_fallback=False → LibreOffice (documento oficial)
+      is_fallback=True  → ReportLab con marca de agua (coordenadas aproximadas)
     """
     assert isinstance(form_data, dict), "form_data debe ser dict, no None"
 
@@ -327,16 +331,16 @@ def generate_crt_pdf(form_data: dict) -> Optional[bytes]:
         if _find_soffice():
             result = generate_crt_pdf_from_excel(form_data)
             if result:
-                return result
+                return result, False
     except Exception as e:
         print(f"[pdf_service] Excel builder falló: {e}, usando fallback ReportLab")
 
-    # Fallback: ReportLab (coordenadas aproximadas)
+    # Fallback: ReportLab con marca de agua BORRADOR NO OFICIAL
     try:
-        return build_crt_pdf(form_data)
+        return build_crt_pdf(form_data, watermark=True), True
     except Exception as e:
         print(f"[pdf_service] ReportLab builder falló: {e}")
-        return None
+        return None, True
 
 
 # Deprecated — el frontend Dash usa generate_crt_pdf() + iframe base64

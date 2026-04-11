@@ -66,10 +66,23 @@ def _get(form: dict, key: str) -> str:
     return _fmt(form.get(key))
 
 
-def build_crt_pdf(form: dict) -> bytes:
+def _draw_watermark(c) -> None:
+    """Estampa 'BORRADOR NO OFICIAL' en diagonal sobre el canvas actual."""
+    c.saveState()
+    c.setFillColorRGB(0.75, 0.0, 0.0, alpha=0.18)
+    c.setFont("Arial-Bold", 52)
+    c.translate(W / 2, H / 2)
+    c.rotate(42)
+    c.drawCentredString(0,  40, "BORRADOR")
+    c.drawCentredString(0, -30, "NO OFICIAL")
+    c.restoreState()
+
+
+def build_crt_pdf(form: dict, watermark: bool = False) -> bytes:
     """
     Genera el PDF CRT completo desde cero.
-    form: dict con keys f_* (mismo formato que pdf_service.py)
+    form:      dict con keys f_* (mismo formato que pdf_service.py)
+    watermark: si True, estampa 'BORRADOR NO OFICIAL' en diagonal
     """
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(W, H))
@@ -431,6 +444,9 @@ def build_crt_pdf(form: dict) -> bytes:
         txt(171.8, 883.3, fecha_em, "Calibri-Bold", 8.3)
 
     # ══════════════════════════════════════════════════════════════════════════
+    if watermark:
+        _draw_watermark(c)
+
     c.save()
     buf.seek(0)
     return buf.read()

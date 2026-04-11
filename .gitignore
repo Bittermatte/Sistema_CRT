@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Entornos virtuales
+venv/
+env/
+.env
+.venv
+
+# Logs (generados en runtime, no versionar)
+logs/
+
+# Archivos temporales y sistema
+.DS_Store
+*.swp
+*.swo
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.iml
+
+# Archivos sensibles
+*.key
+*.pem
+secrets.json

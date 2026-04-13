@@ -138,6 +138,7 @@ def _build_overlay(form: dict) -> bytes:
     clear(140.0, 620.0, 168.0, 638.0)   # Total flete
     clear(449.0, 580.0, 560.0, 622.0)   # Docs anexos números
     clear(286.0, 653.0, 560.0, 692.0)   # Instrucciones aduana
+    clear(52.5,  703.0, 280.0, 726.0)   # Firma remitente (casilla 21)
     clear(444.0, 746.0, 560.0, 762.0)   # Conductor valor
     clear(415.0, 762.0, 424.0, 780.0)   # Patente camión valor
     clear(497.0, 762.0, 560.0, 780.0)   # Patente rampla valor
@@ -185,24 +186,25 @@ def _build_overlay(form: dict) -> bytes:
     text(372.4, 333.0, _get(form, "f_destino_final"), font=F_REGULAR, size=7.3)
     text(95.6,  345.0, _get(form, "f_dir_notificar"), font=F_REGULAR, size=6.4)
 
-    # Casilla 11 — Descripción de carga
-    desc1    = _get(form, "f_descripcion_1")
-    kn1      = _get(form, "f_kilos_netos_1")
-    desc2    = _get(form, "f_descripcion_2")
-    kn2      = _get(form, "f_kilos_netos_2")
-    desc_gen = _get(form, "f_descripcion")
-
-    if desc1:
-        text(60.8, 402.0, desc1, font=F_BOLD, size=7.3)
-        if kn1:
-            text(60.8, 417.0, f"CON: {kn1} KILOS NETOS", font=F_REGULAR, size=7.3)
-    if desc2:
-        text(60.8, 431.0, desc2, font=F_BOLD, size=7.3)
-        if kn2:
-            text(60.8, 446.0, f"CON: {kn2} KILOS NETOS", font=F_REGULAR, size=7.3)
-    if not desc1 and not desc2 and desc_gen:
-        for i, line in enumerate(desc_gen.split("\n")[:4]):
-            text(60.8, 402.0 + i * 15.0, line.strip(), font=F_BOLD, size=7.3)
+    # Casilla 11 — Descripción de carga (hasta 5 líneas dinámicas)
+    Y_DESC_START = 402.0
+    Y_DESC_MAX   = 519.0
+    LINE_H       = 14.4
+    y_cur = Y_DESC_START
+    for n in range(1, 6):
+        desc_n = _get(form, f"f_descripcion_{n}")
+        kn_n   = _get(form, f"f_kilos_netos_{n}")
+        if not desc_n:
+            break
+        if y_cur > Y_DESC_MAX:
+            break
+        text(60.8, y_cur, desc_n, font=F_BOLD, size=7.3)
+        y_cur += LINE_H
+        if kn_n and y_cur <= Y_DESC_MAX:
+            kn_text = kn_n if kn_n.upper().startswith("CON:") else f"CON: {kn_n} KILOS NETOS"
+            text(60.8, y_cur, kn_text, font=F_REGULAR, size=7.3)
+            y_cur += LINE_H
+        y_cur += 2.0
 
     # Casilla 12 — Peso bruto
     pb = _get(form, "f_peso_bruto")
@@ -262,7 +264,10 @@ def _build_overlay(form: dict) -> bytes:
         for i, line in enumerate(instrucciones.split("\n")[:3]):
             text(322.2, [660.0, 672.0, 682.0][i], line.strip(), font=F_REGULAR, size=6.4)
 
-    # Casilla 21 — Fecha firma remitente
+    # Casilla 21 — Firma remitente + fecha
+    firma_rem = _get(form, "f_firma_remitente") or _get(form, "f_transportista")
+    if firma_rem:
+        text(112.5, 713.7, firma_rem, font=F_BOLD, size=8.3)
     fecha_emision = _get(form, "f_fecha_emision")
     if fecha_emision:
         text(171.5, 753.0, fecha_emision, font=F_BOLD, size=8.3)
@@ -296,40 +301,49 @@ def _load_template_bytes() -> Optional[bytes]:
     return PDF_TEMPLATE_PATH.read_bytes()
 
 
-# DEPRECATED — reemplazada por pdf_builder. Conservada como referencia.
-# def generate_crt_pdf(form_data: dict) -> Optional[bytes]:
-#     """Genera el PDF final fusionando plantilla + overlay."""
-#     assert isinstance(form_data, dict)
-#     template_bytes = _load_template_bytes()
-#     if template_bytes is None:
-#         return None
-#     overlay_bytes = _build_overlay(form_data)
-#     template_reader = PdfReader(io.BytesIO(template_bytes))
-#     overlay_reader  = PdfReader(io.BytesIO(overlay_bytes))
-#     writer = PdfWriter()
-#     overlay_page = overlay_reader.pages[0]
-#     overlay_page.merge_page(template_reader.pages[0])
-#     writer.add_page(overlay_page)
-#     out = io.BytesIO()
-#     writer.write(out)
-#     return out.getvalue()
+def _generate_via_overlay(form_data: dict) -> Optional[bytes]:
+    """Fusiona overlay de datos con crt_blanco.pdf via pypdf."""
+    template_bytes = _load_template_bytes()
+    if template_bytes is None:
+        print(f"[pdf_service] Plantilla {PDF_TEMPLATE_PATH} no encontrada")
+        return None
+    overlay_bytes = _build_overlay(form_data)
+    template_reader = PdfReader(io.BytesIO(template_bytes))
+    overlay_reader  = PdfReader(io.BytesIO(overlay_bytes))
+    writer = PdfWriter()
+    overlay_page = overlay_reader.pages[0]
+    overlay_page.merge_page(template_reader.pages[0])
+    writer.add_page(overlay_page)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
-# Nuevo generador (desde cero, sin merge)
 from src.services.pdf_builder import build_crt_pdf
 
 def generate_crt_pdf(form_data: dict) -> tuple[Optional[bytes], bool]:
     """
-    Genera el PDF CRT. Usa Excel+LibreOffice si está disponible,
-    sino cae al builder ReportLab como fallback.
+    Genera el PDF CRT. Orden de intentos:
+      1. Overlay + merge con crt_blanco.pdf (pypdf) — rápido, sin dependencias externas
+      2. Excel + LibreOffice — si LibreOffice está instalado
+      3. ReportLab desde cero — fallback con marca de agua BORRADOR NO OFICIAL
 
     Retorna: (pdf_bytes, is_fallback)
-      is_fallback=False → LibreOffice (documento oficial)
-      is_fallback=True  → ReportLab con marca de agua (coordenadas aproximadas)
+      is_fallback=False → documento oficial (caminos 1 o 2)
+      is_fallback=True  → borrador con marca de agua (camino 3)
     """
     assert isinstance(form_data, dict), "form_data debe ser dict, no None"
 
-    # Intentar con Excel (resultado idéntico al original)
+    # 1. Overlay + merge (no requiere LibreOffice)
+    if _PYPDF_AVAILABLE:
+        try:
+            result = _generate_via_overlay(form_data)
+            if result:
+                return result, False
+        except Exception as e:
+            print(f"[pdf_service] Overlay+merge falló: {e}")
+
+    # 2. Excel + LibreOffice
     try:
         from src.services.excel_pdf_builder import generate_crt_pdf_from_excel, _find_soffice
         if _find_soffice():
@@ -337,9 +351,9 @@ def generate_crt_pdf(form_data: dict) -> tuple[Optional[bytes], bool]:
             if result:
                 return result, False
     except Exception as e:
-        print(f"[pdf_service] Excel builder falló: {e}, usando fallback ReportLab")
+        print(f"[pdf_service] Excel builder falló: {e}")
 
-    # Fallback: ReportLab con marca de agua BORRADOR NO OFICIAL
+    # 3. Fallback: ReportLab con marca de agua BORRADOR NO OFICIAL
     try:
         return build_crt_pdf(form_data, watermark=True), True
     except Exception as e:

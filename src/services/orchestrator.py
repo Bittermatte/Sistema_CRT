@@ -188,10 +188,10 @@ def buscar_match_guia(factura_datos: dict, crts: dict) -> Optional[str]:
     """
     Busca CRT en FALTA_FACTURA que matchee con la factura recibida.
     4 capas en orden de confianza:
-      0. orden_venta (guía) == numero_factura  ← más confiable
+      0. ref_pedido (factura) == orden_venta (guía) — referencia cruzada
       1. Certificado sanitario exacto
-      2. Destinatario por similitud (≥ 0.50)
-      3. Misma pesquera + único candidato
+      2. Destinatario por similitud (≥ MATCH_THRESHOLD = 0.80)
+      3. Misma pesquera → NO auto-matchea, genera estado AMBIGUO
     """
     # Capa 0: ref_pedido (factura) == orden_venta (guía)
     # ref_pedido es el campo específico de la factura que cruza con la guía
@@ -252,10 +252,10 @@ def buscar_match_factura(guia_datos: dict, crts: dict) -> Optional[str]:
     """
     Busca CRT en FALTA_GUIA que matchee con la guía recibida.
     4 capas en orden de confianza:
-      0. orden_venta (guía) == numero_factura  ← más confiable
+      0. orden_venta (guía) == ref_pedido (factura) — referencia cruzada
       1. Certificado sanitario exacto
-      2. Destinatario por similitud (≥ 0.50)
-      3. Misma pesquera + único candidato
+      2. Destinatario por similitud (≥ MATCH_THRESHOLD = 0.80)
+      3. Misma pesquera → NO auto-matchea, genera estado AMBIGUO
     """
     # Capa 0: orden_venta (guía) == ref_pedido (factura en espera)
     ov_g = _normalizar_num(guia_datos.get("orden_venta"))

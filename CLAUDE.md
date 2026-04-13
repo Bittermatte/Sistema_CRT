@@ -28,7 +28,11 @@ pytest --cov=src tests/
 
 ---
 
-## Estado actual del proyecto (2026-04-09)
+## Estado actual del proyecto (2026-04-13)
+
+### Etapa 1 — COMPLETA (branch: claude/add-ambiguous-state-kanban-G6LbR)
+
+Todos los cambios de estabilización están implementados y pusheados. Ver sección "Pendientes" para Etapa 2.
 
 ### Entry point activo
 
@@ -40,11 +44,12 @@ pytest --cov=src tests/
 Usuario sube PDF/Excel
   → clasificar_documento()              # por extensión (.xlsx → factura) o contenido (PDF)
   → extraer_documento()                 # llama extractor guía o factura
+  → log_extraccion()                    # audit_log.py: JSONL append-only en logs/
   → agrupar_documentos()                # motor_agrupacion: agrupa por pesquera/destinatario
   → consolidar_productos_australis()    # Australis: consolida líneas idénticas de factura
   → matching contra store               # 4 capas de matching
   → construir_form_data()               # genera dict f_* por pesquera (casilla 11, 9, etc.)
-  → generate_crt_pdf()                  # PDF vía Excel+LibreOffice o ReportLab fallback
+  → generate_crt_pdf()                  # PDF: overlay+merge → LibreOffice → ReportLab fallback
   → kanban + vista previa               # visible inmediatamente
 ```
 
@@ -54,8 +59,24 @@ Usuario sube PDF/Excel
 |------|----------|-----------|
 | 0 | `orden_venta (guía)` == `ref_pedido (factura)` — referencia cruzada específica por pesquera | Máxima |
 | 1 | `cert_sanitario` exacto en ambos documentos | Alta |
-| 2 | `destinatario` por similitud de texto (≥ 0.50) | Media |
-| 3 | Misma pesquera + único candidato en espera | Baja (fallback) |
+| 2 | `destinatario` por similitud de texto (≥ **0.80**, era 0.50) | Media |
+| 3 | Misma pesquera → marca estado **AMBIGUO** (NO auto-matchea) | Requiere confirmación humana |
+
+### Estados del CRT en el Kanban
+
+| Estado | Badge | Descripción |
+|--------|-------|-------------|
+| `FALTA_FACTURA` | naranja | Solo guía subida, esperando factura |
+| `FALTA_GUIA` | naranja | Solo factura subida, esperando guía |
+| `AMBIGUO` | ámbar | Capa 3 encontró candidatos — requiere confirmación manual |
+| `COMPLETO` | verde | Ambos documentos matcheados con confianza |
+| `ERROR` | rojo | Extracción fallida |
+
+### Generación PDF — orden de intentos en `generate_crt_pdf()`
+
+1. **Overlay + merge** (`_build_overlay()` + pypdf + `crt_blanco.pdf`) — sin LibreOffice, `is_fallback=False`
+2. **Excel + LibreOffice** (`excel_pdf_builder.py`) — si LibreOffice instalado, `is_fallback=False`
+3. **ReportLab desde cero** (`pdf_builder.py`) — fallback con marca de agua "BORRADOR NO OFICIAL", `is_fallback=True`
 
 ---
 
@@ -70,9 +91,10 @@ Usuario sube PDF/Excel
 | `src/dash_ui/theme.py` | ✅ activo | COLORS, CARD_STYLE |
 | `src/dash_ui/layout.py` | ✅ activo | Layout base con navbar y page content |
 | `src/services/orchestrator.py` | ✅ activo | Coordinador central: clasifica → extrae → agrupa → matchea → genera form_data |
-| `src/services/pdf_service.py` | ✅ activo | `generate_crt_pdf()`: usa Excel+LibreOffice si disponible, ReportLab como fallback |
-| `src/services/excel_pdf_builder.py` | ✅ activo | Generador primario: llena plantilla Excel → LibreOffice → PDF |
-| `src/services/pdf_builder.py` | ✅ activo | Generador fallback: ReportLab desde cero (sin LibreOffice) |
+| `src/services/pdf_service.py` | ✅ activo | `generate_crt_pdf()` → tupla `(bytes, is_fallback)`. Camino 1: overlay+merge; Camino 2: LibreOffice; Camino 3: ReportLab fallback |
+| `src/services/audit_log.py` | ✅ activo | Audit log JSONL append-only (`logs/audit_YYYY-MM-DD.jsonl`). Eventos: `documento_extraido`, `crt_descargado` con diff |
+| `src/services/excel_pdf_builder.py` | ✅ activo | Generador secundario: llena plantilla Excel → LibreOffice → PDF |
+| `src/services/pdf_builder.py` | ✅ activo | Generador fallback (Camino 3): ReportLab desde cero, con marca de agua BORRADOR NO OFICIAL |
 | `modulos/config_cliente.py` | ✅ activo | Configs de 6 pesqueras + `ALPHA_BROKERS` + detección automática |
 | `modulos/extractor_guias.py` | ✅ activo | Extrae datos de guías de despacho PDF (incluye tabla de productos por pesquera) |
 | `modulos/extractor_facturas.py` | ✅ activo | Extrae datos de facturas PDF y Excel (.xlsx); extrae productos para Australis |
@@ -169,15 +191,30 @@ Discrepancias se prefijan con `"DISCREPANCIA:"` para que el callback las coloree
 
 Casilla 9 (notificar): si `config["notificar"] == "alpha_brokers"` usa `ALPHA_BROKERS`; si `"destinatario"` copia al destinatario.
 
+### `src/services/audit_log.py`
+
+Audit log legal. Escribe en `logs/audit_YYYY-MM-DD.jsonl` (JSONL append-only, un evento por línea).
+
+- `log_extraccion(nombre_archivo, tipo, pesquera, datos_extraidos)` — llamado tras cada `extraer_documento()`
+- `log_descarga(crt_id, correlativo, estado, form_data_final, guia_datos, factura_datos, is_fallback)` — llamado en callback `descargar_crt`. Incluye **diff** entre datos extraídos y datos finales del PDF (prueba legal de edición manual).
+
+### `src/services/pdf_service.py`
+
+- `_build_overlay(form)` — genera capa ReportLab transparente con todos los campos f_* posicionados sobre `crt_blanco.pdf`. Soporta `f_descripcion_1..5`, `f_kilos_netos_1..5`, `f_firma_remitente`.
+- `_generate_via_overlay(form_data)` — fusiona overlay con template via pypdf. Camino primario.
+- `generate_crt_pdf(form_data)` → `tuple[bytes|None, bool]` — retorna `(pdf_bytes, is_fallback)`.
+- `render_pdf_preview(form_data)` — deprecated (Streamlit). El frontend Dash usa `generate_crt_pdf()` + iframe base64.
+
 ### `src/dash_ui/pages/elaborar_crt.py`
 
 - Upload acepta `.pdf,.xlsx,.xls`
-- CRTs incompletos (FALTA_FACTURA / FALTA_GUIA) muestran borrador PDF inmediatamente
-- Botón descarga: "Descargar borrador" (naranja) para incompletos, "Descargar CRT" (azul) para completos
-- Alertas: naranja = discrepancia logística, rojo = error de procesamiento
+- Estados FALTA_FACTURA/FALTA_GUIA muestran borrador PDF inmediatamente
+- Estado **AMBIGUO**: panel con sugerencias, botones "Confirmar" y "Descartar"
+- Si `is_fallback=True`: badge naranja en preview + modal de advertencia antes de descarga
+- Audit log: `log_descarga()` se llama en `descargar_crt` y `confirmar_descarga_fallback`
 - `dcc.Store` usa `storage_type="session"` — persiste durante la sesión del browser
 
-### `src/services/excel_pdf_builder.py` (generador primario)
+### `src/services/excel_pdf_builder.py` (generador secundario)
 
 Llena `plantillas/crt_plantilla.xlsx` y convierte con LibreOffice headless.
 Requiere LibreOffice instalado: `brew install --cask libreoffice`
@@ -229,27 +266,41 @@ El orquestador los pasa automáticamente desde `config_pesquera`.
 
 ## Pendientes en orden de prioridad
 
-### P1 — Validación (necesario antes de producción con todas las pesqueras)
+### ✅ Etapa 1 — COMPLETADA (2026-04-13)
 
-1. **Probar extractores con PDFs reales de cada pesquera**
+- MATCH_THRESHOLD 0.50 → 0.80
+- Audit log JSONL (`audit_log.py`) con diff legal
+- Estado AMBIGUO + Capa 3 sin auto-match
+- UI AMBIGUO: panel sugerencias, confirmar/descartar
+- `generate_crt_pdf()` retorna tupla `(bytes, is_fallback)`
+- Modal advertencia + marca de agua para fallback PDF
+- Overlay+merge como camino primario (sin LibreOffice)
+- `recalcular_fletes()` en callback confirmar_sugerencia
+
+### P1 — Validación real con documentos (antes de producción)
+
+1. **Probar overlay con PDFs reales de cada pesquera**
+   - Verificar coordenadas de `_build_overlay()` contra documentos reales
+   - Si hay desajustes: ajustar coordenadas en `pdf_service.py`
+   - Comando diagnóstico: `python3 -c "from src.services.pdf_service import _generate_via_overlay, _build_overlay; open('/tmp/test.pdf','wb').write(_generate_via_overlay({'f_remitente':'TEST',...}))"`
+
+2. **Probar extractores con PDFs reales de cada pesquera**
    - Guías Blumar (CANTIDAD|DETALLE), Cermaq, Australis
    - Facturas Excel de Blumar y Cermaq
    - Comando: `python3 -c "from modulos.extractor_guias import extraer_datos_guia; import pprint; pprint.pprint(extraer_datos_guia('ruta/archivo.pdf'))"`
 
-### P2 — Robustez
+### P2 — Etapa 2: Infraestructura producción
 
-2. **Tests unitarios para extractores y orquestador**
-   - No existen tests para `extractor_guias`, `extractor_facturas`, `orchestrator`
-   - Mínimo: test con documentos reales de cada pesquera
+3. **HTTPS + Nginx + dominio** — requisito legal antes de manejar datos de clientes
+4. **Autenticación** — Flask-Login o Dash-Auth; aislamiento por tenant (clave para SaaS)
+5. **Persistencia PostgreSQL** — reemplazar `dcc.Store(session)` con DB; stubs en `db_service.py`
+6. **Fleet DB** — tabla de patentes (307 tractores + 347 semis de Resolución 3811/2019); semáforo de vencimiento
 
-3. **Manejo de múltiples guías con mismo `orden_venta`**
-   - Capa 0 retorna el primero que matchea — si hay 2 guías con mismo PO, solo empareja la primera
+### P3 — Etapa 3: SaaS
 
-### P3 — Fase 2 (base de datos)
-
-4. **Persistencia en base de datos**
-   - Stubs listos en `src/services/db_service.py` y `src/models/crt.py`
-   - Requiere PostgreSQL + SQLAlchemy
+7. **RPA portal MIC** — Playwright para autocompletar formulario MIC con datos del CRT
+8. **Tests de regresión** — pytest con fixtures de PDFs reales por pesquera
+9. **Política de retención de logs** — cron para purgar `logs/` > 90 días
 
 ---
 
@@ -274,8 +325,8 @@ Mac  →  git push  →  GitHub
 ### Configuración del servidor (Ubuntu 22.04)
 
 ```bash
-# Dependencias del sistema
-sudo apt update && sudo apt install -y python3-pip python3-venv git libreoffice-core
+# Dependencias del sistema (libreoffice es opcional — el overlay+merge no lo requiere)
+sudo apt update && sudo apt install -y python3-pip python3-venv git
 
 # Clonar y preparar
 git clone https://github.com/<usuario>/sistema-crt.git

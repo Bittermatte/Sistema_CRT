@@ -18,6 +18,9 @@ env/
 # Logs (generados en runtime, no versionar)
 logs/
 
+# Salida generada por la app
+crts_generados/
+
 # Archivos temporales y sistema
 .DS_Store
 *.swp

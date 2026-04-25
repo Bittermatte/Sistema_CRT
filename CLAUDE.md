@@ -28,11 +28,12 @@ pytest --cov=src tests/
 
 ---
 
-## Estado actual del proyecto (2026-04-13)
+## Estado actual del proyecto (2026-04-25)
 
-### Etapa 1 — COMPLETA (branch: claude/add-ambiguous-state-kanban-G6LbR)
+### Etapa 1 — COMPLETA ✅
+### Etapa 2 — COMPLETA ✅ (separación de CRTs por ciudad/puerto de destino)
 
-Todos los cambios de estabilización están implementados y pusheados. Ver sección "Pendientes" para Etapa 2.
+Todo fusionado en `main`. La rama `claude/add-ambiguous-state-kanban-G6LbR` fue eliminada.
 
 ### Entry point activo
 

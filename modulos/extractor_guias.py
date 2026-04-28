@@ -61,6 +61,7 @@ PATRONES_CONDUCTOR = [
     r"CONDUCTOR\s*[.:/]\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑa-záéíóúñ\s]+?)(?:\n|PATENTE|RUT|DNI|$)",
     r"CHOFER\s*[.:/]\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑa-záéíóúñ\s]+?)(?:\n|PATENTE|RUT|$)",
     r"TRANSPORTISTA\s*[.:/]\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑa-záéíóúñ\s]+?)(?:\n|PATENTE|$)",
+    r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑa-záéíóúñ\s]+?)\s+DE\s+[A-Z]{2}\d{3}[A-Z]{2}",
 ]
 
 # Certificado sanitario / Codaut / RUCE / NEPPEX
@@ -87,7 +88,7 @@ PATRONES_ORDEN_VENTA_PESQUERA = {
     # Multi X: guía dice "N° Pedido: 12345" — factura dice "PV: 12345"
     "multix":           [r"N[°º]\s*PEDIDO\s*[.:]\s*(\d+)"],
     # AquaChile: guía dice "PEDIDO EXPORTACION 12345"
-    "aquachile":        [r"PEDIDO\s+EXPORTACION\s*[.:/]?\s*(\d+)"],
+    "aquachile":        [r"PEDIDO\s+EXPORTACI[OÓ]N\s*[.:/]?\s*(\d+)"],
     # Blumar: guía dice "PO: 12345"
     "blumar":           [r"PO\s*[.:]\s*(\d+)"],
     "blumar_magallanes":[r"PO\s*[.:]\s*(\d+)"],

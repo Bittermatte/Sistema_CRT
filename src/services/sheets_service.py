@@ -41,6 +41,19 @@ PESQUERA_COLORS = {
 }
 
 
+def _fmt_num(val) -> str:
+    """Convierte número a formato español: 41418.46 → 41.418,46"""
+    if val is None or str(val).strip() in ("", "None"):
+        return ""
+    try:
+        f = float(str(val).replace(",", "."))
+        partes = f"{f:,.2f}".split(".")
+        entero = partes[0].replace(",", ".")
+        return f"{entero},{partes[1]}"
+    except (ValueError, TypeError):
+        return str(val).strip()
+
+
 def _get_session() -> AuthorizedSession:
     creds = service_account.Credentials.from_service_account_file(
         str(CREDENTIALS_PATH), scopes=SCOPES
@@ -113,6 +126,17 @@ def _fill_named_ranges(session: AuthorizedSession, sheet_name: str, form_data: d
     while len(instr) < 3:
         instr.append("")
 
+    # --- FIX destino_final: evitar duplicar el prefijo si el extractor ya lo trae ---
+    destino_raw = v("f_destino_final")
+    if destino_raw.upper().startswith("ARGENTINA"):
+        destino_final = destino_raw
+    else:
+        destino_final = f"ARGENTINA - DESTINO FINAL {destino_raw}".strip()
+
+    # --- FIX cert_sanitario: mostrar prefijo siempre, número solo si existe ---
+    cert = v("f_cert_sanitario")
+    cert_sanitario = f"CERTIFICADO SANITARIO NRO: {cert}" if cert not in ("", "None") else "CERTIFICADO SANITARIO NRO: "
+
     campos = {
         "f_remitente":             v("f_remitente"),
         "f_dir_remitente_1":       v("f_dir_remitente").split("\n")[0] if "\n" in v("f_dir_remitente") else v("f_dir_remitente"),
@@ -123,22 +147,22 @@ def _fill_named_ranges(session: AuthorizedSession, sheet_name: str, form_data: d
         "f_lugar_emision":         v("f_lugar_emision"),
         "f_lugar_recepcion_fecha": f"{v('f_lugar_recepcion')}   {v('f_fecha_documento')}".strip(),
         "f_lugar_entrega":         v("f_lugar_entrega"),
-        "f_destino_final":         f"ARGENTINA - DESTINO FINAL {v('f_destino_final')}".strip(),
-        "f_peso_bruto":            v("f_peso_bruto"),
+        "f_destino_final":         destino_final,
+        "f_peso_bruto":            _fmt_num(form_data.get("f_peso_bruto")),
         "f_descripcion_1":         v("f_descripcion_1"),
         "f_descripcion_2":         v("f_descripcion_2"),
         "f_descripcion_3":         v("f_descripcion_3"),
         "f_descripcion_4":         v("f_descripcion_4"),
         "f_descripcion_5":         v("f_descripcion_5"),
         "f_total_cajas":           f"     TOTAL CAJAS: {v('f_total_cajas')}",
-        "f_total_kilos_netos":     f"     TOTAL KILOS NETOS: {v('f_peso_neto')}",
-        "f_total_kilos_brutos":    f"     TOTAL KILOS BRUTOS: {v('f_peso_bruto')}",
-        "f_valor_incoterm":        f"{v('f_valor_mercaderia')} {v('f_incoterm')}".strip(),
-        "f_declaracion_valor":     f"US$ {v('f_valor_mercaderia')}",
-        "f_flete_usd":             v("f_flete_usd"),
+        "f_total_kilos_netos":     f"     TOTAL KILOS NETOS: {_fmt_num(form_data.get('f_peso_neto'))}",
+        "f_total_kilos_brutos":    f"     TOTAL KILOS BRUTOS: {_fmt_num(form_data.get('f_peso_bruto'))}",
+        "f_valor_incoterm":        f"{_fmt_num(form_data.get('f_valor_mercaderia'))} {v('f_incoterm')}".strip(),
+        "f_declaracion_valor":     f"US$ {_fmt_num(form_data.get('f_valor_mercaderia'))}",
+        "f_flete_usd":             _fmt_num(form_data.get("f_flete_usd")),
         "f_facturas_1":            f"FACTURAS NROS: {v('f_num_factura')}",
         "f_guias_1":               f"GUIAS DE DESPACHO: {v('f_guias_despacho')}",
-        "f_cert_sanitario":        f"CERTIFICADO SANITARIO NRO: {v('f_cert_sanitario')}",
+        "f_cert_sanitario":        cert_sanitario,
         "f_instrucciones_1":       instr[0].strip(),
         "f_instrucciones_2":       instr[1].strip(),
         "f_instrucciones_3":       instr[2].strip(),
@@ -170,17 +194,6 @@ def _fill_named_ranges(session: AuthorizedSession, sheet_name: str, form_data: d
             json={"valueInputOption": "USER_ENTERED", "data": data},
         )
         r.raise_for_status()
-
-
-def _export_pdf(session: AuthorizedSession, sheet_id: int) -> bytes:
-    url = (
-        f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export"
-        f"?format=pdf&gid={sheet_id}&size=legal&portrait=true"
-        f"&fitw=true&gridlines=false&printtitle=false&sheetnames=false"
-    )
-    r = session.get(url)
-    r.raise_for_status()
-    return r.content
 
 
 def generate_crt_sheets(form_data: dict, pesquera: str) -> tuple[Optional[bytes], bool]:
